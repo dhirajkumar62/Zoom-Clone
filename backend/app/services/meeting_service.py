@@ -441,3 +441,46 @@ def get_recent_meetings(db: Session, current_user: Optional[User] = None) -> Lis
 
     return q.order_by(Meeting.created_at.desc()).limit(10).all()
 
+
+def mark_participant_left_by_ws(
+    db: Session,
+    raw_id_input: str,
+    user_id: Optional[int] = None,
+    participant_id: Optional[int] = None,
+    display_name: Optional[str] = None
+) -> Optional[Participant]:
+    """Marks a participant as left in DB when WebSocket disconnects or tab is closed."""
+    try:
+        clean_id = normalize_meeting_id(raw_id_input)
+        meeting = db.query(Meeting).filter(Meeting.meeting_id == clean_id).first()
+        if not meeting:
+            return None
+
+        q = db.query(Participant).filter(
+            Participant.meeting_id == meeting.id,
+            Participant.left_at.is_(None)
+        )
+
+        p = None
+        if participant_id:
+            try:
+                p = q.filter(Participant.id == int(participant_id)).first()
+            except Exception:
+                pass
+        if not p and user_id:
+            try:
+                p = q.filter(Participant.user_id == int(user_id)).first()
+            except Exception:
+                pass
+        if not p and display_name:
+            p = q.filter(Participant.display_name == str(display_name)).first()
+
+        if p and not p.left_at:
+            p.left_at = datetime.utcnow()
+            db.commit()
+            db.refresh(p)
+            return p
+    except Exception as err:
+        print(f"Error marking participant left by ws: {err}")
+    return None
+

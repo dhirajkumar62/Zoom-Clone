@@ -587,6 +587,21 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
   const handleLeaveMeeting = async () => {
     if (stream) stream.getTracks().forEach((track) => track.stop());
     if (screenStream) screenStream.getTracks().forEach((track) => track.stop());
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      try {
+        wsRef.current.send(
+          JSON.stringify({
+            event: 'user_left',
+            sender_id: myKey,
+            sender_name: displayName,
+            user_id: currentUser?.id,
+            participant_id: participantId,
+          })
+        );
+      } catch {
+        // Ignore WS send error on leave
+      }
+    }
     try {
       await leaveMeeting(meeting.meeting_id, participantId);
     } catch {
@@ -676,25 +691,66 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
     return () => clearInterval(interval);
   }, [meeting.meeting_id]);
 
+  // Add pagehide/beforeunload listeners for instant tab/window close detection
+  useEffect(() => {
+    const handleBeforeUnload = () => {
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        try {
+          wsRef.current.send(
+            JSON.stringify({
+              event: 'user_left',
+              sender_id: myKey,
+              sender_name: displayName,
+              user_id: currentUser?.id,
+              participant_id: participantId,
+            })
+          );
+        } catch {
+          // Ignore write error during teardown
+        }
+      }
+      try {
+        const cleanId = meeting.meeting_id.replace(/\D/g, '');
+        const envUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000/api';
+        const cleanUrl = envUrl.replace(/\/+$/, '');
+        const baseUrl = cleanUrl.endsWith('/api') ? cleanUrl : `${cleanUrl}/api`;
+        const leaveUrl = `${baseUrl}/meetings/${cleanId}/leave?participant_id=${participantId || ''}`;
+        if (typeof navigator !== 'undefined' && navigator.sendBeacon) {
+          navigator.sendBeacon(leaveUrl);
+        }
+      } catch {
+        // Ignore beacon errors
+      }
+    };
+
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    window.addEventListener('pagehide', handleBeforeUnload);
+    return () => {
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+      window.removeEventListener('pagehide', handleBeforeUnload);
+    };
+  }, [meeting.meeting_id, participantId, currentUser?.id, displayName, myKey]);
+
   // Real-Time WebSocket event listener
   useEffect(() => {
     if (typeof window === 'undefined') return;
 
     const cleanId = meeting.meeting_id.replace(/\D/g, '');
     const envApiUrl = process.env.NEXT_PUBLIC_API_URL || '';
+    const queryParams = `?user_id=${currentUser?.id || ''}&participant_id=${participantId || ''}&display_name=${encodeURIComponent(displayName || '')}`;
     let wsUrl: string;
 
     if (envApiUrl) {
       const cleanApi = envApiUrl.replace(/\/+$/, '');
       const wsBase = cleanApi.replace(/^http/, 'ws');
       wsUrl = cleanApi.endsWith('/api')
-        ? `${wsBase}/ws/meetings/${cleanId}`
-        : `${wsBase}/api/ws/meetings/${cleanId}`;
+        ? `${wsBase}/ws/meetings/${cleanId}${queryParams}`
+        : `${wsBase}/api/ws/meetings/${cleanId}${queryParams}`;
     } else {
       const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const wsHost = window.location.hostname || 'localhost';
       const portStr = wsHost === 'localhost' || wsHost === '127.0.0.1' ? ':8000' : '';
-      wsUrl = `${wsProtocol}//${wsHost}${portStr}/api/ws/meetings/${cleanId}`;
+      wsUrl = `${wsProtocol}//${wsHost}${portStr}/api/ws/meetings/${cleanId}${queryParams}`;
     }
 
     let ws: WebSocket | null = null;
@@ -708,6 +764,8 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
             event: 'user_joined',
             sender_id: myKey,
             sender_name: displayName,
+            user_id: currentUser?.id,
+            participant_id: participantId,
           })
         );
 
