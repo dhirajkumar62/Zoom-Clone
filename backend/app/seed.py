@@ -6,7 +6,6 @@ from app.core.security import hash_password
 
 
 def seed_database(db: Session):
-    Base.metadata.drop_all(bind=engine)
     Base.metadata.create_all(bind=engine)
 
 

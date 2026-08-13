@@ -5,7 +5,21 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./zoom_clone.db")
+env_db_url = os.getenv("DATABASE_URL")
+
+if not env_db_url:
+    backend_dir = os.path.dirname(os.path.abspath(__file__))
+    root_dir = os.path.dirname(backend_dir)
+    db_file = os.path.join(root_dir, "zoom_clone.db")
+    DATABASE_URL = f"sqlite:///{db_file}"
+elif env_db_url.startswith("sqlite:///./"):
+    backend_dir = os.path.dirname(os.path.abspath(__file__))
+    root_dir = os.path.dirname(backend_dir)
+    rel_path = env_db_url.replace("sqlite:///./", "")
+    db_file = os.path.join(root_dir, rel_path)
+    DATABASE_URL = f"sqlite:///{db_file}"
+else:
+    DATABASE_URL = env_db_url
 
 engine = create_engine(
     DATABASE_URL,
