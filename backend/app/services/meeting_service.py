@@ -355,11 +355,37 @@ def leave_meeting(
 
     participant = q.order_by(Participant.joined_at.desc()).first()
 
+    clean_id = normalize_meeting_id(raw_id_input)
+
     if participant and not participant.left_at:
         participant.left_at = datetime.utcnow()
         db.commit()
         db.refresh(participant)
+
+        try:
+            import asyncio
+            from app.core.ws_manager import ws_manager
+            asyncio.create_task(ws_manager.broadcast(clean_id, {
+                "event": "participant_left",
+                "participant_id": participant.id,
+                "user_id": current_user.id,
+                "display_name": current_user.name
+            }))
+        except Exception:
+            pass
+
         return participant
+
+    try:
+        import asyncio
+        from app.core.ws_manager import ws_manager
+        asyncio.create_task(ws_manager.broadcast(clean_id, {
+            "event": "participant_left",
+            "user_id": current_user.id,
+            "display_name": current_user.name
+        }))
+    except Exception:
+        pass
 
     return Participant(
         meeting_id=meeting.id,

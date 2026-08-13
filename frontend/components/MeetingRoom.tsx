@@ -71,12 +71,15 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
   const [remoteScreenShare, setRemoteScreenShare] = useState<{
     isSharing: boolean;
     sharerName: string;
-    sharerUserId: number | null;
+    sharerUserId: number | string | null;
+    streamId: string | null;
   }>({
     isSharing: false,
     sharerName: '',
     sharerUserId: null,
+    streamId: null,
   });
+  const remoteScreenShareStreamIdRef = useRef<string | null>(null);
 
   // Active WebSocket reference for real-time signaling & chat
   const wsRef = useRef<WebSocket | null>(null);
@@ -89,6 +92,37 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
 
   const { user: currentUser } = useAuth();
   const myKey = currentUser?.id ?? participantId ?? displayName;
+
+  // Cleanup helper when a participant leaves or is removed
+  const removeParticipantFromState = (key: string | number) => {
+    const keyStr = String(key);
+    peerConnections.current.forEach((pc, pKey) => {
+      if (String(pKey) === keyStr) {
+        pc.close();
+        peerConnections.current.delete(pKey);
+      }
+    });
+    remoteStreams.current.forEach((_, rKey) => {
+      if (String(rKey) === keyStr) {
+        remoteStreams.current.delete(rKey);
+      }
+    });
+    setRemoteStreamsState((prev) => {
+      const next = { ...prev };
+      Object.keys(next).forEach((k) => {
+        if (String(k) === keyStr) {
+          delete next[k];
+        }
+      });
+      return next;
+    });
+
+    if (remoteScreenShare.sharerUserId && String(remoteScreenShare.sharerUserId) === keyStr) {
+      setRemoteScreenShare({ isSharing: false, sharerName: '', sharerUserId: null, streamId: null });
+      remoteScreenShareStreamIdRef.current = null;
+      setRemoteScreenShareStream(null);
+    }
+  };
 
   // WebRTC Peer Connection Factory & Signaling Logic
   const createPeerConnection = (targetKey: string | number) => {
@@ -134,22 +168,26 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
       const streamToUse = incomingStream || new MediaStream([event.track]);
 
       const trackLabel = event.track.label.toLowerCase();
-      const streamId = streamToUse.id.toLowerCase();
+      const streamId = streamToUse.id;
       const isScreenTrack =
         event.track.kind === 'video' &&
-        (trackLabel.includes('screen') ||
+        (
+          (remoteScreenShareStreamIdRef.current && streamId === remoteScreenShareStreamIdRef.current) ||
+          trackLabel.includes('screen') ||
           trackLabel.includes('display') ||
-          streamId.includes('screen') ||
-          remoteScreenShare.sharerUserId === targetKey);
+          streamId.toLowerCase().includes('screen')
+        );
 
       if (isScreenTrack) {
         setRemoteScreenShareStream(streamToUse);
       } else {
-        remoteStreams.current.set(targetKey, streamToUse);
-        setRemoteStreamsState((prev) => ({
-          ...prev,
-          [targetKey]: streamToUse,
-        }));
+        if (!remoteScreenShareStreamIdRef.current || streamId !== remoteScreenShareStreamIdRef.current) {
+          remoteStreams.current.set(targetKey, streamToUse);
+          setRemoteStreamsState((prev) => ({
+            ...prev,
+            [targetKey]: streamToUse,
+          }));
+        }
       }
     };
 
@@ -474,6 +512,7 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
               sharer_name: displayName,
               sharer_user_id: currentUser?.id,
               sharer_participant_id: participantId,
+              screen_stream_id: displayStream.id,
             })
           );
         }
@@ -614,7 +653,18 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
   const loadRealParticipants = async () => {
     try {
       const data = await getMeetingParticipants(meeting.meeting_id);
-      setParticipants(data);
+      const activeData = data.filter((p) => !p.left_at && !p.is_removed);
+      setParticipants(activeData);
+
+      // Clean up connections for participants who are no longer active
+      const activeKeys = new Set(
+        activeData.map((p) => String(p.user_id || p.display_name || p.id))
+      );
+      peerConnections.current.forEach((_, pKey) => {
+        if (!activeKeys.has(String(pKey)) && String(pKey) !== String(myKey)) {
+          removeParticipantFromState(pKey);
+        }
+      });
     } catch {
       // Keep existing list on transient fetch error
     }
@@ -668,6 +718,7 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
               sharer_name: displayName,
               sharer_user_id: currentUser?.id,
               sharer_participant_id: participantId,
+              screen_stream_id: screenStream?.id,
             })
           );
         }
@@ -715,17 +766,20 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
             });
           } else if (data.event === 'screen_share_started') {
             if (data.sharer_user_id !== currentUser?.id && data.sharer_name !== displayName) {
+              remoteScreenShareStreamIdRef.current = data.screen_stream_id || null;
               setRemoteScreenShare({
                 isSharing: true,
                 sharerName: data.sharer_name,
                 sharerUserId: data.sharer_user_id,
+                streamId: data.screen_stream_id || null,
               });
               setToastNotice(`${data.sharer_name} started sharing screen`);
               setTimeout(() => setToastNotice(null), 4000);
             }
           } else if (data.event === 'screen_share_stopped') {
             if (data.sharer_user_id !== currentUser?.id) {
-              setRemoteScreenShare({ isSharing: false, sharerName: '', sharerUserId: null });
+              remoteScreenShareStreamIdRef.current = null;
+              setRemoteScreenShare({ isSharing: false, sharerName: '', sharerUserId: null, streamId: null });
               setRemoteScreenShareStream(null);
               setToastNotice('Screen sharing ended');
               setTimeout(() => setToastNotice(null), 3000);
@@ -734,7 +788,12 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
             setIsMicOn(false);
             setToastNotice('The meeting host has muted all participants.');
             setTimeout(() => setToastNotice(null), 4000);
-          } else if (data.event === 'participant_removed') {
+          } else if (data.event === 'participant_left' || data.event === 'participant_removed') {
+            if (data.user_id) removeParticipantFromState(data.user_id);
+            if (data.display_name) removeParticipantFromState(data.display_name);
+            if (data.target_user_id) removeParticipantFromState(data.target_user_id);
+            if (data.participant_id) removeParticipantFromState(data.participant_id);
+
             if (data.target_user_id === currentUser?.id || data.participant_id === participantId) {
               setRemovedNotice('You have been removed from the meeting by the host.');
               if (stream) stream.getTracks().forEach((t) => t.stop());
@@ -745,7 +804,7 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
             } else {
               loadRealParticipants();
             }
-          } else if (data.event === 'participant_joined' || data.event === 'participant_left') {
+          } else if (data.event === 'participant_joined') {
             loadRealParticipants();
             if (isScreenSharing && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
               wsRef.current.send(
@@ -754,6 +813,7 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
                   sharer_name: displayName,
                   sharer_user_id: currentUser?.id,
                   sharer_participant_id: participantId,
+                  screen_stream_id: screenStream?.id,
                 })
               );
             }
@@ -827,8 +887,10 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
     return 'grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 max-w-7xl mx-auto';
   };
 
-  const activeParticipantsList = participants.length > 0
-    ? participants
+  const validActiveParticipants = participants.filter((p) => !p.left_at && !p.is_removed);
+
+  const activeParticipantsList = validActiveParticipants.length > 0
+    ? validActiveParticipants
     : [
         {
           id: participantId || 1,
