@@ -68,6 +68,18 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
   const screenVideoRef = useRef<HTMLVideoElement | null>(null);
   const [screenStream, setScreenStream] = useState<MediaStream | null>(null);
   const [screenShareError, setScreenShareError] = useState<string | null>(null);
+  const [remoteScreenShare, setRemoteScreenShare] = useState<{
+    isSharing: boolean;
+    sharerName: string;
+    sharerUserId: number | null;
+  }>({
+    isSharing: false,
+    sharerName: '',
+    sharerUserId: null,
+  });
+
+  // Active WebSocket reference for real-time signaling & chat
+  const wsRef = useRef<WebSocket | null>(null);
 
   // Chat state
   const [messages, setMessages] = useState<ChatMessage[]>([
@@ -249,6 +261,14 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
         setScreenStream(null);
       }
       setIsScreenSharing(false);
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(
+          JSON.stringify({
+            event: 'screen_share_stopped',
+            sharer_user_id: currentUser?.id,
+          })
+        );
+      }
       return;
     }
 
@@ -263,6 +283,17 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
         setScreenStream(displayStream);
         setIsScreenSharing(true);
 
+        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+          wsRef.current.send(
+            JSON.stringify({
+              event: 'screen_share_started',
+              sharer_name: displayName,
+              sharer_user_id: currentUser?.id,
+              sharer_participant_id: participantId,
+            })
+          );
+        }
+
         if (screenVideoRef.current) {
           screenVideoRef.current.srcObject = displayStream;
         }
@@ -273,11 +304,29 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
           videoTrack.onended = () => {
             setIsScreenSharing(false);
             setScreenStream(null);
+            if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+              wsRef.current.send(
+                JSON.stringify({
+                  event: 'screen_share_stopped',
+                  sharer_user_id: currentUser?.id,
+                })
+              );
+            }
           };
         }
       } else {
         // Fallback to simulation mode if browser doesn't support getDisplayMedia
         setIsScreenSharing(true);
+        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+          wsRef.current.send(
+            JSON.stringify({
+              event: 'screen_share_started',
+              sharer_name: displayName,
+              sharer_user_id: currentUser?.id,
+              sharer_participant_id: participantId,
+            })
+          );
+        }
       }
     } catch (err: any) {
       console.warn('Screen share canceled or failed:', err);
@@ -329,16 +378,35 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
     e.preventDefault();
     if (!chatInput.trim()) return;
 
+    const msgText = chatInput.trim();
+    const msgId = `${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+    const msgTimestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
     const newMsg: ChatMessage = {
-      id: Date.now().toString(),
+      id: msgId,
       sender: displayName,
-      text: chatInput.trim(),
-      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      text: msgText,
+      timestamp: msgTimestamp,
       isSelf: true,
     };
 
     setMessages((prev) => [...prev, newMsg]);
     setChatInput('');
+
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(
+        JSON.stringify({
+          event: 'chat_message',
+          message: {
+            id: msgId,
+            sender: displayName,
+            text: msgText,
+            timestamp: msgTimestamp,
+            sender_user_id: currentUser?.id,
+          },
+        })
+      );
+    }
   };
 
   // Real participants state fetched from DB
@@ -367,18 +435,78 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
   // Real-Time WebSocket event listener
   useEffect(() => {
     if (typeof window === 'undefined') return;
+
     const cleanId = meeting.meeting_id.replace(/\D/g, '');
-    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsHost = window.location.hostname || 'localhost';
-    const wsUrl = `${wsProtocol}//${wsHost}:8000/api/ws/meetings/${cleanId}`;
+    const envApiUrl = process.env.NEXT_PUBLIC_API_URL || '';
+    let wsUrl: string;
+
+    if (envApiUrl) {
+      const cleanApi = envApiUrl.replace(/\/+$/, '');
+      const wsBase = cleanApi.replace(/^http/, 'ws');
+      wsUrl = cleanApi.endsWith('/api')
+        ? `${wsBase}/ws/meetings/${cleanId}`
+        : `${wsBase}/api/ws/meetings/${cleanId}`;
+    } else {
+      const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const wsHost = window.location.hostname || 'localhost';
+      const portStr = wsHost === 'localhost' || wsHost === '127.0.0.1' ? ':8000' : '';
+      wsUrl = `${wsProtocol}//${wsHost}${portStr}/api/ws/meetings/${cleanId}`;
+    }
 
     let ws: WebSocket | null = null;
     try {
       ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        if (isScreenSharing) {
+          ws?.send(
+            JSON.stringify({
+              event: 'screen_share_started',
+              sharer_name: displayName,
+              sharer_user_id: currentUser?.id,
+              sharer_participant_id: participantId,
+            })
+          );
+        }
+      };
+
       ws.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
-          if (data.event === 'mute_all') {
+          if (data.event === 'chat_message' && data.message) {
+            const isFromSelf =
+              data.message.sender_user_id === currentUser?.id || data.message.sender === displayName;
+            setMessages((prev) => {
+              if (prev.some((m) => m.id === data.message.id)) return prev;
+              return [
+                ...prev,
+                {
+                  id: data.message.id,
+                  sender: data.message.sender,
+                  text: data.message.text,
+                  timestamp: data.message.timestamp,
+                  isSelf: isFromSelf,
+                },
+              ];
+            });
+          } else if (data.event === 'screen_share_started') {
+            if (data.sharer_user_id !== currentUser?.id && data.sharer_name !== displayName) {
+              setRemoteScreenShare({
+                isSharing: true,
+                sharerName: data.sharer_name,
+                sharerUserId: data.sharer_user_id,
+              });
+              setToastNotice(`${data.sharer_name} started sharing screen`);
+              setTimeout(() => setToastNotice(null), 4000);
+            }
+          } else if (data.event === 'screen_share_stopped') {
+            if (data.sharer_user_id !== currentUser?.id) {
+              setRemoteScreenShare({ isSharing: false, sharerName: '', sharerUserId: null });
+              setToastNotice('Screen sharing ended');
+              setTimeout(() => setToastNotice(null), 3000);
+            }
+          } else if (data.event === 'mute_all') {
             setIsMicOn(false);
             setToastNotice('The meeting host has muted all participants.');
             setTimeout(() => setToastNotice(null), 4000);
@@ -395,6 +523,16 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
             }
           } else if (data.event === 'participant_joined' || data.event === 'participant_left') {
             loadRealParticipants();
+            if (isScreenSharing && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+              wsRef.current.send(
+                JSON.stringify({
+                  event: 'screen_share_started',
+                  sharer_name: displayName,
+                  sharer_user_id: currentUser?.id,
+                  sharer_participant_id: participantId,
+                })
+              );
+            }
           }
         } catch {
           // Ignore parse errors
@@ -405,9 +543,12 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
     }
 
     return () => {
-      if (ws) ws.close();
+      if (ws) {
+        ws.close();
+        wsRef.current = null;
+      }
     };
-  }, [meeting.meeting_id, currentUser?.id, participantId, stream, screenStream, router]);
+  }, [meeting.meeting_id, currentUser?.id, displayName, participantId, stream, screenStream, router, isScreenSharing]);
 
   // Determine current user's meeting role
   const myParticipant = participants.find(
@@ -543,23 +684,25 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
       <div className="flex-1 flex overflow-hidden relative">
         {/* Central Stage / Video Grid */}
         <main className="flex-1 p-4 lg:p-6 flex flex-col justify-center items-center relative overflow-hidden bg-radial from-gray-900 to-[#070a12]">
-          {isScreenSharing ? (
-            /* Active Screen Sharing Feed */
+          {isScreenSharing || remoteScreenShare.isSharing ? (
+            /* Active Screen Sharing Feed (Self or Remote Participant/Admin) */
             <div className="w-full h-full glass-card rounded-3xl border border-blue-500/40 p-4 lg:p-6 flex flex-col items-center justify-center relative overflow-hidden bg-black">
               <div className="absolute top-4 left-4 z-20 flex items-center gap-2 px-3 py-1.5 rounded-full bg-blue-600/30 backdrop-blur-md text-blue-300 border border-blue-500/40 text-xs font-semibold">
                 <Monitor className="w-4 h-4 animate-pulse text-blue-400" />
-                <span>{displayName} is sharing screen</span>
+                <span>{isScreenSharing ? displayName : remoteScreenShare.sharerName} is sharing screen</span>
               </div>
 
-              <button
-                onClick={handleToggleScreenShare}
-                className="absolute top-4 right-4 z-20 flex items-center gap-2 px-3 py-1.5 rounded-full bg-red-600/80 hover:bg-red-600 text-white text-xs font-bold shadow-lg transition-all"
-              >
-                <StopCircle className="w-4 h-4" />
-                <span>Stop Sharing</span>
-              </button>
+              {isScreenSharing && (
+                <button
+                  onClick={handleToggleScreenShare}
+                  className="absolute top-4 right-4 z-20 flex items-center gap-2 px-3 py-1.5 rounded-full bg-red-600/80 hover:bg-red-600 text-white text-xs font-bold shadow-lg transition-all"
+                >
+                  <StopCircle className="w-4 h-4" />
+                  <span>Stop Sharing</span>
+                </button>
+              )}
 
-              {screenStream ? (
+              {isScreenSharing && screenStream ? (
                 <video
                   ref={screenVideoRef}
                   autoPlay
@@ -567,14 +710,16 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
                   className="w-full h-full object-contain rounded-2xl"
                 />
               ) : (
-                /* Simulated Screen View Fallback */
+                /* Live Presentation Stream / Remote Screen View */
                 <div className="text-center space-y-4 max-w-md">
-                  <div className="w-20 h-20 rounded-3xl bg-blue-600/10 border border-blue-500/30 flex items-center justify-center mx-auto text-blue-400 shadow-2xl">
+                  <div className="w-20 h-20 rounded-3xl bg-blue-600/10 border border-blue-500/30 flex items-center justify-center mx-auto text-blue-400 shadow-2xl animate-pulse">
                     <Monitor className="w-10 h-10" />
                   </div>
                   <h3 className="text-xl font-bold text-gray-100">Live Presentation Stream</h3>
                   <p className="text-xs text-gray-400 leading-relaxed">
-                    Screen share feed active. High resolution stream connected to meeting buffer.
+                    {isScreenSharing
+                      ? 'Your screen share stream is active and broadcasted to all meeting participants.'
+                      : `${remoteScreenShare.sharerName} is currently presenting their screen live to all meeting participants.`}
                   </p>
                 </div>
               )}
