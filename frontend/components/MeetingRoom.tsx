@@ -1,0 +1,899 @@
+'use client';
+
+import React, { useState, useEffect, useRef } from 'react';
+import {
+  Mic,
+  MicOff,
+  Video as VideoIcon,
+  VideoOff,
+  Monitor,
+  Users,
+  MessageSquare,
+  PhoneOff,
+  Copy,
+  Check,
+  Shield,
+  Send,
+  X,
+  Settings as SettingsIcon,
+  Camera,
+  Volume2,
+  AlertCircle,
+  Sliders,
+  StopCircle
+} from 'lucide-react';
+import { useRouter } from 'next/navigation';
+import { Meeting, Participant } from '@/lib/types';
+import { formatMeetingId } from '@/lib/utils';
+import { leaveMeeting, endMeeting, getMeetingParticipants, updateParticipantRole, removeParticipant } from '@/lib/api';
+import { useAuth } from '@/context/AuthContext';
+
+interface MeetingRoomProps {
+  meeting: Meeting;
+  displayName: string;
+  participantId?: number;
+}
+
+interface ChatMessage {
+  id: string;
+  sender: string;
+  text: string;
+  timestamp: string;
+  isSelf: boolean;
+}
+
+export default function MeetingRoom({ meeting, displayName, participantId }: MeetingRoomProps) {
+  const router = useRouter();
+
+  // Control states
+  const [isMicOn, setIsMicOn] = useState(true);
+  const [isCameraOn, setIsCameraOn] = useState(true);
+  const [isScreenSharing, setIsScreenSharing] = useState(false);
+  const [activeTab, setActiveTab] = useState<'none' | 'participants' | 'chat'>('none');
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
+
+  // Real Webcam Media Stream state
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const [stream, setStream] = useState<MediaStream | null>(null);
+  const [useRealWebcam, setUseRealWebcam] = useState(true);
+  const [webcamError, setWebcamError] = useState<string | null>(null);
+  const [videoDevices, setVideoDevices] = useState<MediaDeviceInfo[]>([]);
+  const [audioDevices, setAudioDevices] = useState<MediaDeviceInfo[]>([]);
+  const [selectedVideoDeviceId, setSelectedVideoDeviceId] = useState<string>('');
+  const [selectedAudioDeviceId, setSelectedAudioDeviceId] = useState<string>('');
+
+  // Screen Sharing Media Stream state
+  const screenVideoRef = useRef<HTMLVideoElement | null>(null);
+  const [screenStream, setScreenStream] = useState<MediaStream | null>(null);
+  const [screenShareError, setScreenShareError] = useState<string | null>(null);
+
+  // Chat state
+  const [messages, setMessages] = useState<ChatMessage[]>([
+    {
+      id: '1',
+      sender: 'System Bot',
+      text: `Welcome to "${meeting.title}". You are logged in as ${displayName}.`,
+      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      isSelf: false,
+    },
+  ]);
+  const [chatInput, setChatInput] = useState('');
+
+  // Simulated canvas camera stream (fallback when camera unavailable or simulation selected)
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  const formattedId = formatMeetingId(meeting.meeting_id);
+  const fullInviteUrl = typeof window !== 'undefined'
+    ? `${window.location.origin}/meeting/${meeting.meeting_id}`
+    : `/meeting/${meeting.meeting_id}`;
+
+  // Meeting duration timer clock
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setElapsedSeconds((prev) => prev + 1);
+    }, 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const formatTimer = (totalSecs: number) => {
+    const hrs = Math.floor(totalSecs / 3600);
+    const mins = Math.floor((totalSecs % 3600) / 60);
+    const secs = totalSecs % 60;
+    if (hrs > 0) {
+      return `${hrs.toString().padStart(2, '0')}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+    }
+    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+  };
+
+  // Enumerate hardware devices (camera & microphone)
+  useEffect(() => {
+    if (typeof window !== 'undefined' && navigator.mediaDevices?.enumerateDevices) {
+      navigator.mediaDevices.enumerateDevices().then((devices) => {
+        const vDevices = devices.filter((d) => d.kind === 'videoinput');
+        const aDevices = devices.filter((d) => d.kind === 'audioinput');
+
+        setVideoDevices(vDevices);
+        setAudioDevices(aDevices);
+
+        if (vDevices.length > 0 && !selectedVideoDeviceId) {
+          setSelectedVideoDeviceId(vDevices[0].deviceId);
+        }
+        if (aDevices.length > 0 && !selectedAudioDeviceId) {
+          setSelectedAudioDeviceId(aDevices[0].deviceId);
+        }
+      }).catch(() => {});
+    }
+  }, [selectedVideoDeviceId, selectedAudioDeviceId]);
+
+  // Request & attach real webcam stream
+  useEffect(() => {
+    let currentStream: MediaStream | null = null;
+
+    async function initWebcam() {
+      if (!isCameraOn || !useRealWebcam) {
+        if (stream) {
+          stream.getTracks().forEach((track) => track.stop());
+          setStream(null);
+        }
+        return;
+      }
+
+      try {
+        setWebcamError(null);
+        const videoConstraint = selectedVideoDeviceId
+          ? { deviceId: { exact: selectedVideoDeviceId } }
+          : true;
+        const audioConstraint = selectedAudioDeviceId
+          ? { deviceId: { exact: selectedAudioDeviceId } }
+          : true;
+
+        const constraints: MediaStreamConstraints = {
+          video: videoConstraint,
+          audio: audioConstraint,
+        };
+
+        const mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
+        currentStream = mediaStream;
+        setStream(mediaStream);
+
+        // Control mic audio track state
+        mediaStream.getAudioTracks().forEach((track) => {
+          track.enabled = isMicOn;
+        });
+
+        if (videoRef.current) {
+          videoRef.current.srcObject = mediaStream;
+        }
+      } catch (err: any) {
+        console.warn('Real webcam/mic access error:', err);
+        setWebcamError(err.message || 'Camera or microphone permission denied / busy. Using simulation mode.');
+        setUseRealWebcam(false); // Fallback to interactive canvas visualizer
+      }
+    }
+
+    initWebcam();
+
+    return () => {
+      if (currentStream) {
+        currentStream.getTracks().forEach((track) => track.stop());
+      }
+    };
+  }, [isCameraOn, useRealWebcam, selectedVideoDeviceId, selectedAudioDeviceId]);
+
+  // Update microphone track state when user toggles mute/unmute button
+  useEffect(() => {
+    if (stream) {
+      stream.getAudioTracks().forEach((track) => {
+        track.enabled = isMicOn;
+      });
+    }
+  }, [isMicOn, stream]);
+
+  // Canvas visualizer rendering for simulated mode or fallback
+  useEffect(() => {
+    if (!isCameraOn || useRealWebcam || !canvasRef.current) return;
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    let animId: number;
+    let step = 0;
+
+    const render = () => {
+      step += 0.04;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      const bgGrad = ctx.createLinearGradient(0, 0, canvas.width, canvas.height);
+      bgGrad.addColorStop(0, '#0f172a');
+      bgGrad.addColorStop(0.5, '#1e1b4b');
+      bgGrad.addColorStop(1, '#090d16');
+      ctx.fillStyle = bgGrad;
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      const orbX = canvas.width / 2 + Math.sin(step) * 30;
+      const orbY = canvas.height / 2 + Math.cos(step * 0.8) * 20;
+      const orbGrad = ctx.createRadialGradient(orbX, orbY, 10, orbX, orbY, 180);
+      orbGrad.addColorStop(0, 'rgba(59, 130, 246, 0.35)');
+      orbGrad.addColorStop(1, 'rgba(0, 0, 0, 0)');
+      ctx.fillStyle = orbGrad;
+      ctx.beginPath();
+      ctx.arc(orbX, orbY, 180, 0, Math.PI * 2);
+      ctx.fill();
+
+      if (isMicOn) {
+        ctx.fillStyle = 'rgba(59, 130, 246, 0.7)';
+        const barCount = 12;
+        const barWidth = 6;
+        const startX = (canvas.width - barCount * 12) / 2;
+        for (let i = 0; i < barCount; i++) {
+          const h = 10 + Math.sin(step * 4 + i) * 25 + Math.cos(step * 2 + i) * 15;
+          ctx.fillRect(startX + i * 12, canvas.height - 40 - h, barWidth, h);
+        }
+      }
+
+      animId = requestAnimationFrame(render);
+    };
+
+    render();
+    return () => cancelAnimationFrame(animId);
+  }, [isCameraOn, useRealWebcam, isMicOn]);
+
+  // Real Screen Share Handler (Screen Capture API)
+  const handleToggleScreenShare = async () => {
+    if (isScreenSharing) {
+      // Stop active screen share
+      if (screenStream) {
+        screenStream.getTracks().forEach((track) => track.stop());
+        setScreenStream(null);
+      }
+      setIsScreenSharing(false);
+      return;
+    }
+
+    try {
+      setScreenShareError(null);
+      if (typeof window !== 'undefined' && navigator.mediaDevices?.getDisplayMedia) {
+        const displayStream = await navigator.mediaDevices.getDisplayMedia({
+          video: true,
+          audio: true,
+        });
+
+        setScreenStream(displayStream);
+        setIsScreenSharing(true);
+
+        if (screenVideoRef.current) {
+          screenVideoRef.current.srcObject = displayStream;
+        }
+
+        // Listen for when the user clicks browser's native "Stop Sharing" floating bar
+        const videoTrack = displayStream.getVideoTracks()[0];
+        if (videoTrack) {
+          videoTrack.onended = () => {
+            setIsScreenSharing(false);
+            setScreenStream(null);
+          };
+        }
+      } else {
+        // Fallback to simulation mode if browser doesn't support getDisplayMedia
+        setIsScreenSharing(true);
+      }
+    } catch (err: any) {
+      console.warn('Screen share canceled or failed:', err);
+      if (err.name !== 'NotAllowedError') {
+        setScreenShareError(err.message || 'Screen sharing failed. Simulation mode active.');
+      }
+      // If user canceled browser picker, keep screen sharing off
+    }
+  };
+
+  // Attach stream to screen video element when screenStream updates
+  useEffect(() => {
+    if (isScreenSharing && screenStream && screenVideoRef.current) {
+      screenVideoRef.current.srcObject = screenStream;
+    }
+  }, [isScreenSharing, screenStream]);
+
+  const handleCopyLink = () => {
+    navigator.clipboard.writeText(fullInviteUrl);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  const handleLeaveMeeting = async () => {
+    if (stream) stream.getTracks().forEach((track) => track.stop());
+    if (screenStream) screenStream.getTracks().forEach((track) => track.stop());
+    try {
+      await leaveMeeting(meeting.meeting_id, participantId);
+    } catch {
+      // Ignore error on exit
+    }
+    router.push('/');
+  };
+
+  const handleEndMeeting = async () => {
+    if (confirm('Are you sure you want to end this meeting for all participants?')) {
+      if (stream) stream.getTracks().forEach((track) => track.stop());
+      if (screenStream) screenStream.getTracks().forEach((track) => track.stop());
+      try {
+        await endMeeting(meeting.meeting_id);
+      } catch {
+        // Ignore error
+      }
+      router.push('/');
+    }
+  };
+
+  const handleSendMessage = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!chatInput.trim()) return;
+
+    const newMsg: ChatMessage = {
+      id: Date.now().toString(),
+      sender: displayName,
+      text: chatInput.trim(),
+      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      isSelf: true,
+    };
+
+    setMessages((prev) => [...prev, newMsg]);
+    setChatInput('');
+  };
+
+  // Real participants state fetched from DB
+  const [participants, setParticipants] = useState<Participant[]>(meeting.participants || []);
+  const { user: currentUser } = useAuth();
+
+  const loadRealParticipants = async () => {
+    try {
+      const data = await getMeetingParticipants(meeting.meeting_id);
+      setParticipants(data);
+    } catch {
+      // Keep existing list on transient fetch error
+    }
+  };
+
+  useEffect(() => {
+    loadRealParticipants();
+    const interval = setInterval(loadRealParticipants, 3000);
+    return () => clearInterval(interval);
+  }, [meeting.meeting_id]);
+
+  // Determine current user's meeting role
+  const myParticipant = participants.find(
+    (p) => p.user_id === currentUser?.id || p.display_name === displayName
+  );
+  const myMeetingRole = myParticipant?.meeting_role || (currentUser?.id === meeting.host_user_id ? 'HOST' : 'PARTICIPANT');
+
+  const canManageRoles =
+    myMeetingRole === 'HOST' ||
+    myMeetingRole === 'CO_HOST' ||
+    currentUser?.account_role === 'OWNER' ||
+    currentUser?.account_role === 'ADMIN';
+
+  const handleRoleChange = async (targetParticipant: Participant, newRole: string) => {
+    try {
+      await updateParticipantRole(meeting.meeting_id, targetParticipant.id, newRole);
+      loadRealParticipants();
+    } catch (err: any) {
+      alert(err.message || 'Failed to update participant role');
+    }
+  };
+
+  const handleRemoveParticipant = async (targetParticipant: Participant) => {
+    if (!confirm(`Are you sure you want to remove ${targetParticipant.display_name} from this meeting?`)) return;
+    try {
+      await removeParticipant(meeting.meeting_id, targetParticipant.id);
+      loadRealParticipants();
+    } catch (err: any) {
+      alert(err.message || 'Failed to remove participant');
+    }
+  };
+
+
+  return (
+    <div className="flex flex-col h-screen w-screen bg-[#070a12] text-white overflow-hidden select-none">
+      {/* Top Meeting Header Bar */}
+      <header className="h-16 px-6 glass-panel border-b border-gray-800 flex items-center justify-between z-30">
+        <div className="flex items-center gap-4">
+          <div className="flex items-center gap-2">
+            <Shield className="w-4 h-4 text-emerald-400" />
+            <h1 className="font-bold text-base text-gray-100 tracking-tight line-clamp-1 max-w-xs md:max-w-md">
+              {meeting.title}
+            </h1>
+          </div>
+
+          <div className="hidden sm:flex items-center gap-2 px-3 py-1 rounded-full bg-gray-900/80 border border-gray-800 text-xs text-gray-300">
+            <span className="text-gray-400">Meeting ID:</span>
+            <span className="font-mono font-bold text-blue-400">{formattedId}</span>
+            <button
+              onClick={handleCopyLink}
+              className="p-1 hover:text-white transition-colors ml-1"
+              title="Copy meeting link"
+            >
+              {copied ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5 text-gray-400" />}
+            </button>
+          </div>
+        </div>
+
+        {/* Timer, Settings & Controls */}
+        <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2 px-3 py-1 rounded-full bg-blue-500/10 border border-blue-500/30 text-blue-400 text-xs font-mono font-semibold">
+            <span className="w-2 h-2 rounded-full bg-blue-400 animate-pulse" />
+            {formatTimer(elapsedSeconds)}
+          </div>
+
+          <button
+            onClick={() => setIsSettingsOpen(true)}
+            className="p-2 rounded-xl text-gray-400 hover:text-white hover:bg-gray-800/80 transition-colors flex items-center gap-1.5 text-xs font-medium border border-gray-800"
+            title="Audio & Video Settings"
+          >
+            <SettingsIcon className="w-4 h-4 text-blue-400" />
+            <span className="hidden md:inline">Settings</span>
+          </button>
+        </div>
+      </header>
+
+      {/* Main Stage & Drawers Layout */}
+      <div className="flex-1 flex overflow-hidden relative">
+        {/* Central Stage / Video Grid */}
+        <main className="flex-1 p-4 lg:p-6 flex flex-col justify-center items-center relative overflow-hidden bg-radial from-gray-900 to-[#070a12]">
+          {isScreenSharing ? (
+            /* Active Screen Sharing Feed */
+            <div className="w-full h-full glass-card rounded-3xl border border-blue-500/40 p-4 lg:p-6 flex flex-col items-center justify-center relative overflow-hidden bg-black">
+              <div className="absolute top-4 left-4 z-20 flex items-center gap-2 px-3 py-1.5 rounded-full bg-blue-600/30 backdrop-blur-md text-blue-300 border border-blue-500/40 text-xs font-semibold">
+                <Monitor className="w-4 h-4 animate-pulse text-blue-400" />
+                <span>{displayName} is sharing screen</span>
+              </div>
+
+              <button
+                onClick={handleToggleScreenShare}
+                className="absolute top-4 right-4 z-20 flex items-center gap-2 px-3 py-1.5 rounded-full bg-red-600/80 hover:bg-red-600 text-white text-xs font-bold shadow-lg transition-all"
+              >
+                <StopCircle className="w-4 h-4" />
+                <span>Stop Sharing</span>
+              </button>
+
+              {screenStream ? (
+                <video
+                  ref={screenVideoRef}
+                  autoPlay
+                  playsInline
+                  className="w-full h-full object-contain rounded-2xl"
+                />
+              ) : (
+                /* Simulated Screen View Fallback */
+                <div className="text-center space-y-4 max-w-md">
+                  <div className="w-20 h-20 rounded-3xl bg-blue-600/10 border border-blue-500/30 flex items-center justify-center mx-auto text-blue-400 shadow-2xl">
+                    <Monitor className="w-10 h-10" />
+                  </div>
+                  <h3 className="text-xl font-bold text-gray-100">Live Presentation Stream</h3>
+                  <p className="text-xs text-gray-400 leading-relaxed">
+                    Screen share feed active. High resolution stream connected to meeting buffer.
+                  </p>
+                </div>
+              )}
+            </div>
+          ) : (
+            /* Video Grid Layout */
+            <div className="w-full h-full max-w-6xl grid grid-cols-1 md:grid-cols-2 gap-4 lg:gap-6 items-center justify-center">
+              {/* Tile 1: Current User Video Feed */}
+              <div className="relative w-full h-full min-h-[260px] glass-card rounded-3xl overflow-hidden border border-gray-800/80 shadow-2xl flex items-center justify-center group bg-black">
+                {isCameraOn ? (
+                  useRealWebcam ? (
+                    <video
+                      ref={videoRef}
+                      autoPlay
+                      playsInline
+                      muted
+                      className="w-full h-full object-cover transform -scale-x-100"
+                    />
+                  ) : (
+                    <canvas ref={canvasRef} width={640} height={480} className="w-full h-full object-cover" />
+                  )
+                ) : (
+                  <div className="flex flex-col items-center gap-3">
+                    <div className="w-24 h-24 rounded-full bg-gradient-to-tr from-blue-600 to-indigo-600 flex items-center justify-center text-white font-bold text-2xl shadow-2xl border-2 border-white/20">
+                      {displayName.slice(0, 2).toUpperCase()}
+                    </div>
+                    <span className="text-xs font-medium text-gray-400">Camera turned off</span>
+                  </div>
+                )}
+
+                {/* Camera Mode Badge */}
+                {isCameraOn && (
+                  <div className="absolute top-4 right-4 flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-black/60 backdrop-blur-md border border-white/10 text-[10px] text-gray-300">
+                    <Camera className="w-3 h-3 text-blue-400" />
+                    <span>{useRealWebcam ? 'Live Webcam' : 'Simulated Feed'}</span>
+                  </div>
+                )}
+
+                {/* Name Overlay & Microphone Status Badge */}
+                <div className="absolute bottom-4 left-4 flex items-center gap-2 px-3 py-1.5 rounded-xl bg-black/60 backdrop-blur-md border border-white/10 text-xs font-medium text-white">
+                  <span>{displayName} (You)</span>
+                  {isMicOn ? (
+                    <div className="flex items-center gap-1 text-emerald-400" title="Microphone Active">
+                      <Mic className="w-3.5 h-3.5" />
+                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                    </div>
+                  ) : (
+                    <div className="flex items-center gap-1 text-red-400" title="Microphone Muted">
+                      <MicOff className="w-3.5 h-3.5" />
+                      <span className="text-[10px] font-bold uppercase">Muted</span>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Tile 2: Host / Participant Tile */}
+              <div className="relative w-full h-full min-h-[260px] glass-card rounded-3xl overflow-hidden border border-gray-800/80 shadow-2xl flex items-center justify-center group">
+                <div className="absolute inset-0 bg-gradient-to-tr from-indigo-950/40 via-gray-900 to-slate-900 flex flex-col items-center justify-center">
+                  <div className="w-24 h-24 rounded-full bg-gradient-to-tr from-indigo-500 to-purple-600 flex items-center justify-center text-white font-bold text-2xl shadow-2xl border-2 border-white/20 relative">
+                    DU
+                    <span className="absolute bottom-1 right-1 w-4 h-4 bg-emerald-500 border-2 border-gray-900 rounded-full" />
+                  </div>
+                </div>
+
+                {/* Name Overlay */}
+                <div className="absolute bottom-4 left-4 flex items-center gap-2 px-3 py-1.5 rounded-xl bg-black/60 backdrop-blur-md border border-white/10 text-xs font-medium text-white">
+                  <span>Default User (Host)</span>
+                  <Mic className="w-3.5 h-3.5 text-emerald-400" />
+                </div>
+              </div>
+            </div>
+          )}
+        </main>
+
+        {/* Side Drawer: Participants List */}
+        {activeTab === 'participants' && (
+          <aside className="w-80 glass-panel border-l border-gray-800 flex flex-col z-20 animate-slideLeft">
+            <div className="p-4 border-b border-gray-800 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Users className="w-4 h-4 text-blue-400" />
+                <h3 className="font-bold text-sm text-gray-100">
+                  Live Participants ({participants.length})
+                </h3>
+              </div>
+              <button
+                onClick={() => setActiveTab('none')}
+                className="p-1 text-gray-400 hover:text-white transition-colors"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="flex-1 overflow-y-auto p-4 space-y-3">
+              {participants.map((p) => {
+                const isMe = p.user_id === currentUser?.id || p.display_name === displayName;
+
+                return (
+                  <div
+                    key={p.id}
+                    className="p-3 rounded-xl bg-gray-900/60 border border-gray-800/80 text-xs space-y-2"
+                  >
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2.5">
+                        <div className="w-8 h-8 rounded-full bg-blue-600/30 text-blue-300 font-semibold flex items-center justify-center border border-blue-500/30">
+                          {p.display_name.slice(0, 2).toUpperCase()}
+                        </div>
+                        <div>
+                          <span className="font-semibold text-gray-200 block">
+                            {p.display_name} {isMe && '(You)'}
+                          </span>
+                          <span className="text-[10px] text-gray-500 font-mono">
+                            Joined {new Date(p.joined_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                          </span>
+                        </div>
+                      </div>
+
+                      <div className="flex items-center gap-1.5">
+                        {p.meeting_role === 'HOST' && (
+                          <span className="px-2 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/40 text-[10px] font-bold">
+                            HOST
+                          </span>
+                        )}
+                        {p.meeting_role === 'CO_HOST' && (
+                          <span className="px-2 py-0.5 rounded bg-purple-500/20 text-purple-300 border border-purple-500/40 text-[10px] font-bold">
+                            CO-HOST
+                          </span>
+                        )}
+                        {p.meeting_role === 'PARTICIPANT' && (
+                          <span className="px-2 py-0.5 rounded bg-blue-500/10 text-blue-400 border border-blue-500/30 text-[10px] font-medium">
+                            MEMBER
+                          </span>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Host Management Options */}
+                    {canManageRoles && !isMe && p.meeting_role !== 'HOST' && (
+                      <div className="flex items-center justify-end gap-2 pt-2 border-t border-gray-800/60">
+                        <select
+                          value={p.meeting_role}
+                          onChange={(e) => handleRoleChange(p, e.target.value)}
+                          className="py-1 px-2 rounded text-[11px] bg-gray-800 border border-gray-700 text-gray-200 focus:outline-none"
+                        >
+                          <option value="PARTICIPANT">Set Participant</option>
+                          <option value="CO_HOST">Set Co-Host</option>
+                        </select>
+                        <button
+                          onClick={() => handleRemoveParticipant(p)}
+                          className="px-2 py-1 rounded bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/20 text-[11px] font-semibold transition-colors"
+                        >
+                          Remove
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </aside>
+        )}
+
+
+        {/* Side Drawer: In-Meeting Live Chat */}
+        {activeTab === 'chat' && (
+          <aside className="w-80 glass-panel border-l border-gray-800 flex flex-col z-20 animate-slideLeft">
+            <div className="p-4 border-b border-gray-800 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <MessageSquare className="w-4 h-4 text-blue-400" />
+                <h3 className="font-bold text-sm text-gray-100">In-Meeting Chat</h3>
+              </div>
+              <button
+                onClick={() => setActiveTab('none')}
+                className="p-1 text-gray-400 hover:text-white transition-colors"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="flex-1 overflow-y-auto p-4 space-y-3">
+              {messages.map((msg) => (
+                <div
+                  key={msg.id}
+                  className={`flex flex-col space-y-1 ${msg.isSelf ? 'items-end' : 'items-start'}`}
+                >
+                  <div className="flex items-center gap-2 text-[10px] text-gray-400 px-1">
+                    <span className="font-semibold">{msg.sender}</span>
+                    <span>{msg.timestamp}</span>
+                  </div>
+                  <div
+                    className={`p-3 rounded-2xl text-xs leading-relaxed max-w-[85%] ${
+                      msg.isSelf
+                        ? 'bg-blue-600 text-white rounded-tr-none'
+                        : 'bg-gray-800 text-gray-200 rounded-tl-none border border-gray-700'
+                    }`}
+                  >
+                    {msg.text}
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <form onSubmit={handleSendMessage} className="p-3 border-t border-gray-800 flex gap-2">
+              <input
+                type="text"
+                placeholder="Type a message..."
+                value={chatInput}
+                onChange={(e) => setChatInput(e.target.value)}
+                className="flex-1 px-3 py-2 rounded-xl text-xs glass-input text-white placeholder-gray-500"
+              />
+              <button
+                type="submit"
+                className="p-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-white transition-colors"
+              >
+                <Send className="w-4 h-4" />
+              </button>
+            </form>
+          </aside>
+        )}
+      </div>
+
+      {/* Modal: Camera & Microphone Hardware Settings */}
+      {isSettingsOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-md animate-fadeIn">
+          <div className="glass-panel w-full max-w-lg p-6 rounded-3xl border border-gray-800 shadow-2xl space-y-6">
+            <div className="flex items-center justify-between border-b border-gray-800 pb-4">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-2xl bg-blue-500/15 border border-blue-500/30 flex items-center justify-center text-blue-400">
+                  <Sliders className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-lg font-bold text-white">Audio & Video Settings</h3>
+                  <p className="text-xs text-gray-400">Configure webcam hardware and microphone inputs</p>
+                </div>
+              </div>
+              <button
+                onClick={() => setIsSettingsOpen(false)}
+                className="p-1.5 rounded-full text-gray-400 hover:text-white hover:bg-gray-800 transition-colors"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {webcamError && (
+              <div className="p-3.5 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-300 text-xs flex items-center gap-2.5">
+                <AlertCircle className="w-4 h-4 text-amber-400 flex-shrink-0" />
+                <span>{webcamError}</span>
+              </div>
+            )}
+
+            <div className="space-y-4">
+              {/* Toggle Real Webcam vs Simulated Stream */}
+              <div className="flex items-center justify-between p-4 rounded-2xl bg-gray-900/80 border border-gray-800">
+                <div>
+                  <h4 className="text-sm font-semibold text-gray-200">Real Camera Stream (`getUserMedia`)</h4>
+                  <p className="text-xs text-gray-400 mt-0.5">Use your physical computer webcam feed</p>
+                </div>
+                <button
+                  onClick={() => setUseRealWebcam(!useRealWebcam)}
+                  className={`w-12 h-6 flex items-center rounded-full p-1 transition-colors ${
+                    useRealWebcam ? 'bg-blue-600 justify-end' : 'bg-gray-700 justify-start'
+                  }`}
+                >
+                  <span className="w-4 h-4 rounded-full bg-white shadow-md" />
+                </button>
+              </div>
+
+              {/* Camera Device Selector */}
+              {useRealWebcam && (
+                <div>
+                  <label className="block text-xs font-semibold uppercase tracking-wider text-gray-400 mb-2">
+                    Select Camera Input Device
+                  </label>
+                  <select
+                    value={selectedVideoDeviceId}
+                    onChange={(e) => setSelectedVideoDeviceId(e.target.value)}
+                    className="w-full px-4 py-2.5 rounded-xl text-sm glass-input text-white bg-gray-900 border border-gray-800"
+                  >
+                    {videoDevices.length > 0 ? (
+                      videoDevices.map((device, idx) => (
+                        <option key={device.deviceId || idx} value={device.deviceId}>
+                          {device.label || `Camera ${idx + 1}`}
+                        </option>
+                      ))
+                    ) : (
+                      <option value="">Default Web Camera</option>
+                    )}
+                  </select>
+                </div>
+              )}
+
+              {/* Microphone Device Selector */}
+              <div>
+                <label className="block text-xs font-semibold uppercase tracking-wider text-gray-400 mb-2">
+                  Select Microphone (Mike) Input Device
+                </label>
+                <select
+                  value={selectedAudioDeviceId}
+                  onChange={(e) => setSelectedAudioDeviceId(e.target.value)}
+                  className="w-full px-4 py-2.5 rounded-xl text-sm glass-input text-white bg-gray-900 border border-gray-800"
+                >
+                  {audioDevices.length > 0 ? (
+                    audioDevices.map((device, idx) => (
+                      <option key={device.deviceId || idx} value={device.deviceId}>
+                        {device.label || `Microphone ${idx + 1}`}
+                      </option>
+                    ))
+                  ) : (
+                    <option value="">Default System Microphone</option>
+                  )}
+                </select>
+              </div>
+            </div>
+
+            <div className="flex justify-end pt-4 border-t border-gray-800">
+              <button
+                onClick={() => setIsSettingsOpen(false)}
+                className="px-5 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-semibold text-xs transition-all shadow-md shadow-blue-600/30"
+              >
+                Save & Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Bottom Floating Control Toolbar */}
+      <footer className="h-20 px-6 glass-panel border-t border-gray-800 flex items-center justify-between z-30">
+        {/* Left Info */}
+        <div className="hidden md:flex items-center gap-2 text-xs text-gray-400">
+          <Volume2 className="w-4 h-4 text-gray-400" />
+          <span>High Definition Audio Stream</span>
+        </div>
+
+        {/* Center Control Buttons */}
+        <div className="flex items-center gap-3 mx-auto md:mx-0">
+          {/* Mute Mic */}
+          <button
+            onClick={() => setIsMicOn(!isMicOn)}
+            className={`p-3.5 rounded-2xl flex items-center gap-2 transition-all font-semibold text-xs ${
+              isMicOn
+                ? 'bg-gray-800 hover:bg-gray-700 text-gray-100 border border-gray-700'
+                : 'bg-red-500/20 hover:bg-red-500/30 text-red-400 border border-red-500/40'
+            }`}
+            title={isMicOn ? 'Mute Microphone' : 'Unmute Microphone'}
+          >
+            {isMicOn ? <Mic className="w-5 h-5" /> : <MicOff className="w-5 h-5 text-red-400" />}
+          </button>
+
+          {/* Toggle Camera */}
+          <button
+            onClick={() => setIsCameraOn(!isCameraOn)}
+            className={`p-3.5 rounded-2xl flex items-center gap-2 transition-all font-semibold text-xs ${
+              isCameraOn
+                ? 'bg-gray-800 hover:bg-gray-700 text-gray-100 border border-gray-700'
+                : 'bg-red-500/20 hover:bg-red-500/30 text-red-400 border border-red-500/40'
+            }`}
+            title={isCameraOn ? 'Turn Off Camera' : 'Turn On Camera'}
+          >
+            {isCameraOn ? <VideoIcon className="w-5 h-5" /> : <VideoOff className="w-5 h-5 text-red-400" />}
+          </button>
+
+          {/* Screen Share */}
+          <button
+            onClick={handleToggleScreenShare}
+            className={`p-3.5 rounded-2xl flex items-center gap-2 transition-all font-semibold text-xs ${
+              isScreenSharing
+                ? 'bg-blue-600 text-white shadow-lg shadow-blue-600/30 ring-2 ring-blue-400/50'
+                : 'bg-gray-800 hover:bg-gray-700 text-gray-100 border border-gray-700'
+            }`}
+            title={isScreenSharing ? 'Stop Screen Sharing' : 'Share Screen'}
+          >
+            <Monitor className="w-5 h-5" />
+            <span className="hidden lg:inline">{isScreenSharing ? 'Stop Sharing' : 'Share Screen'}</span>
+          </button>
+
+          {/* Participants */}
+          <button
+            onClick={() => setActiveTab(activeTab === 'participants' ? 'none' : 'participants')}
+            className={`p-3.5 rounded-2xl flex items-center gap-2 transition-all font-semibold text-xs relative ${
+              activeTab === 'participants'
+                ? 'bg-blue-600 text-white'
+                : 'bg-gray-800 hover:bg-gray-700 text-gray-100 border border-gray-700'
+            }`}
+            title="Participants"
+          >
+            <Users className="w-5 h-5" />
+            <span className="hidden sm:inline">Participants</span>
+          </button>
+
+          {/* Chat */}
+          <button
+            onClick={() => setActiveTab(activeTab === 'chat' ? 'none' : 'chat')}
+            className={`p-3.5 rounded-2xl flex items-center gap-2 transition-all font-semibold text-xs ${
+              activeTab === 'chat'
+                ? 'bg-blue-600 text-white'
+                : 'bg-gray-800 hover:bg-gray-700 text-gray-100 border border-gray-700'
+            }`}
+            title="In-Meeting Chat"
+          >
+            <MessageSquare className="w-5 h-5" />
+            <span className="hidden sm:inline">Chat</span>
+          </button>
+
+          {/* Leave Button */}
+          <button
+            onClick={handleLeaveMeeting}
+            className="flex items-center gap-2 px-5 py-3.5 rounded-2xl bg-red-600 hover:bg-red-500 text-white font-bold text-xs shadow-lg shadow-red-600/30 transition-all ml-2"
+          >
+            <PhoneOff className="w-5 h-5" />
+            <span>Leave</span>
+          </button>
+        </div>
+
+        {/* Right End Call Host Action */}
+        <div className="hidden lg:flex items-center gap-2">
+          <button
+            onClick={handleEndMeeting}
+            className="px-3 py-2 rounded-xl text-xs font-semibold text-red-400 hover:bg-red-500/10 border border-red-500/30 transition-colors"
+          >
+            End Meeting for All
+          </button>
+        </div>
+      </footer>
+    </div>
+  );
+}
