@@ -90,6 +90,11 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
   const [remoteStreamsState, setRemoteStreamsState] = useState<{ [key: string | number]: MediaStream }>({});
   const [remoteScreenShareStream, setRemoteScreenShareStream] = useState<MediaStream | null>(null);
 
+  const remoteScreenShareRef = useRef(remoteScreenShare);
+  useEffect(() => {
+    remoteScreenShareRef.current = remoteScreenShare;
+  }, [remoteScreenShare]);
+
   const { user: currentUser } = useAuth();
   const myKey = currentUser?.id ?? participantId ?? displayName;
 
@@ -175,20 +180,23 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
           (remoteScreenShareStreamIdRef.current && streamId === remoteScreenShareStreamIdRef.current) ||
           trackLabel.includes('screen') ||
           trackLabel.includes('display') ||
-          streamId.toLowerCase().includes('screen')
+          streamId.toLowerCase().includes('screen') ||
+          (remoteScreenShareRef.current.isSharing &&
+            (String(targetKey) === String(remoteScreenShareRef.current.sharerUserId) ||
+             String(targetKey) === String(remoteScreenShareRef.current.sharerName)))
         );
 
-      if (isScreenTrack) {
+      if (isScreenTrack || remoteScreenShareRef.current.isSharing) {
         setRemoteScreenShareStream(streamToUse);
-      } else {
-        if (!remoteScreenShareStreamIdRef.current || streamId !== remoteScreenShareStreamIdRef.current) {
-          remoteStreams.current.set(targetKey, streamToUse);
-          setRemoteStreamsState((prev) => ({
-            ...prev,
-            [targetKey]: streamToUse,
-          }));
-        }
       }
+
+      remoteStreams.current.set(targetKey, streamToUse);
+      remoteStreams.current.set(String(targetKey), streamToUse);
+      setRemoteStreamsState((prev) => ({
+        ...prev,
+        [targetKey]: streamToUse,
+        [String(targetKey)]: streamToUse,
+      }));
     };
 
     peerConnections.current.set(targetKey, pc);
@@ -1048,38 +1056,38 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
                 </button>
               )}
 
-              {isScreenSharing && screenStream ? (
-                <video
-                  ref={screenVideoRef}
-                  autoPlay
-                  playsInline
-                  className="w-full h-full object-contain rounded-2xl"
-                />
-              ) : remoteScreenShare.isSharing && (remoteScreenShareStream || (remoteScreenShare.sharerUserId ? remoteStreamsState[remoteScreenShare.sharerUserId] : null)) ? (
+              {isScreenSharing ? (
                 <video
                   ref={(el) => {
-                    const activeStr = remoteScreenShareStream || (remoteScreenShare.sharerUserId ? remoteStreamsState[remoteScreenShare.sharerUserId] : null);
+                    if (el && screenStream) {
+                      el.srcObject = screenStream;
+                    }
+                  }}
+                  autoPlay
+                  playsInline
+                  muted
+                  className="w-full h-full object-contain rounded-2xl"
+                />
+              ) : (
+                <video
+                  ref={(el) => {
+                    const activeStr =
+                      remoteScreenShareStream ||
+                      (remoteScreenShare.sharerUserId ? remoteStreamsState[remoteScreenShare.sharerUserId] : null) ||
+                      (remoteScreenShare.sharerUserId ? remoteStreamsState[String(remoteScreenShare.sharerUserId)] : null) ||
+                      (remoteScreenShare.sharerName ? remoteStreamsState[remoteScreenShare.sharerName] : null) ||
+                      Object.values(remoteStreamsState)[0] ||
+                      null;
+
                     if (el && activeStr) {
                       el.srcObject = activeStr;
+                      el.play().catch(() => {});
                     }
                   }}
                   autoPlay
                   playsInline
                   className="w-full h-full object-contain rounded-2xl"
                 />
-              ) : (
-                /* Live Presentation Stream / Remote Screen View */
-                <div className="text-center space-y-4 max-w-md">
-                  <div className="w-20 h-20 rounded-3xl bg-blue-600/10 border border-blue-500/30 flex items-center justify-center mx-auto text-blue-400 shadow-2xl animate-pulse">
-                    <Monitor className="w-10 h-10" />
-                  </div>
-                  <h3 className="text-xl font-bold text-gray-100">Live Presentation Stream</h3>
-                  <p className="text-xs text-gray-400 leading-relaxed">
-                    {isScreenSharing
-                      ? 'Your screen share stream is active and broadcasted to all meeting participants.'
-                      : `${remoteScreenShare.sharerName} is currently presenting their screen live to all meeting participants.`}
-                  </p>
-                </div>
               )}
             </div>
           ) : (
