@@ -81,6 +81,161 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
   // Active WebSocket reference for real-time signaling & chat
   const wsRef = useRef<WebSocket | null>(null);
 
+  // WebRTC Peer Connections & Remote Streams state
+  const peerConnections = useRef<Map<string | number, RTCPeerConnection>>(new Map());
+  const remoteStreams = useRef<Map<string | number, MediaStream>>(new Map());
+  const [remoteStreamsState, setRemoteStreamsState] = useState<{ [key: string | number]: MediaStream }>({});
+  const [remoteScreenShareStream, setRemoteScreenShareStream] = useState<MediaStream | null>(null);
+
+  const { user: currentUser } = useAuth();
+  const myKey = currentUser?.id ?? participantId ?? displayName;
+
+  // WebRTC Peer Connection Factory & Signaling Logic
+  const createPeerConnection = (targetKey: string | number) => {
+    if (peerConnections.current.has(targetKey)) {
+      return peerConnections.current.get(targetKey)!;
+    }
+
+    const pc = new RTCPeerConnection({
+      iceServers: [
+        {
+          urls: 'stun:stun.l.google.com:19302',
+        },
+      ],
+    });
+
+    if (stream) {
+      stream.getTracks().forEach((track) => {
+        pc.addTrack(track, stream);
+      });
+    }
+
+    if (screenStream) {
+      screenStream.getTracks().forEach((track) => {
+        pc.addTrack(track, screenStream);
+      });
+    }
+
+    pc.onicecandidate = (event) => {
+      if (event.candidate && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(
+          JSON.stringify({
+            event: 'webrtc_ice_candidate',
+            target_id: targetKey,
+            sender_id: myKey,
+            candidate: event.candidate,
+          })
+        );
+      }
+    };
+
+    pc.ontrack = (event) => {
+      const [incomingStream] = event.streams;
+      const streamToUse = incomingStream || new MediaStream([event.track]);
+
+      const trackLabel = event.track.label.toLowerCase();
+      const streamId = streamToUse.id.toLowerCase();
+      const isScreenTrack =
+        event.track.kind === 'video' &&
+        (trackLabel.includes('screen') ||
+          trackLabel.includes('display') ||
+          streamId.includes('screen') ||
+          remoteScreenShare.sharerUserId === targetKey);
+
+      if (isScreenTrack) {
+        setRemoteScreenShareStream(streamToUse);
+      } else {
+        remoteStreams.current.set(targetKey, streamToUse);
+        setRemoteStreamsState((prev) => ({
+          ...prev,
+          [targetKey]: streamToUse,
+        }));
+      }
+    };
+
+    peerConnections.current.set(targetKey, pc);
+    return pc;
+  };
+
+  const initiateOffer = async (targetKey: string | number) => {
+    try {
+      const pc = createPeerConnection(targetKey);
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(
+          JSON.stringify({
+            event: 'webrtc_offer',
+            target_id: targetKey,
+            sender_id: myKey,
+            offer: offer,
+          })
+        );
+      }
+    } catch (err) {
+      console.warn('Error creating WebRTC offer:', err);
+    }
+  };
+
+  const handleOffer = async (senderKey: string | number, offer: RTCSessionDescriptionInit) => {
+    try {
+      const pc = createPeerConnection(senderKey);
+      await pc.setRemoteDescription(new RTCSessionDescription(offer));
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(
+          JSON.stringify({
+            event: 'webrtc_answer',
+            target_id: senderKey,
+            sender_id: myKey,
+            answer: answer,
+          })
+        );
+      }
+    } catch (err) {
+      console.warn('Error handling WebRTC offer:', err);
+    }
+  };
+
+  const handleAnswer = async (senderKey: string | number, answer: RTCSessionDescriptionInit) => {
+    try {
+      const pc = peerConnections.current.get(senderKey);
+      if (pc && pc.signalingState !== 'stable') {
+        await pc.setRemoteDescription(new RTCSessionDescription(answer));
+      }
+    } catch (err) {
+      console.warn('Error handling WebRTC answer:', err);
+    }
+  };
+
+  const handleIceCandidate = async (senderKey: string | number, candidate: RTCIceCandidateInit) => {
+    try {
+      const pc = peerConnections.current.get(senderKey);
+      if (pc) {
+        await pc.addIceCandidate(new RTCIceCandidate(candidate));
+      }
+    } catch (err) {
+      console.warn('Error adding ICE candidate:', err);
+    }
+  };
+
+  // Synchronize local stream tracks with all active peer connections
+  useEffect(() => {
+    if (!stream) return;
+    peerConnections.current.forEach((pc) => {
+      stream.getTracks().forEach((track) => {
+        const senders = pc.getSenders();
+        const existingSender = senders.find((s) => s.track?.kind === track.kind);
+        if (existingSender) {
+          existingSender.replaceTrack(track);
+        } else {
+          pc.addTrack(track, stream);
+        }
+      });
+    });
+  }, [stream]);
+
   // Chat state
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
@@ -261,6 +416,19 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
         setScreenStream(null);
       }
       setIsScreenSharing(false);
+
+      peerConnections.current.forEach((pc) => {
+        pc.getSenders().forEach((sender) => {
+          if (
+            sender.track &&
+            (sender.track.label.toLowerCase().includes('screen') ||
+              sender.track.label.toLowerCase().includes('display'))
+          ) {
+            pc.removeTrack(sender);
+          }
+        });
+      });
+
       if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
         wsRef.current.send(
           JSON.stringify({
@@ -269,6 +437,12 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
           })
         );
       }
+
+      participants.forEach((p) => {
+        if (p.user_id !== currentUser?.id && p.display_name !== displayName) {
+          initiateOffer(p.user_id || p.display_name);
+        }
+      });
       return;
     }
 
@@ -283,6 +457,16 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
         setScreenStream(displayStream);
         setIsScreenSharing(true);
 
+        if (screenVideoRef.current) {
+          screenVideoRef.current.srcObject = displayStream;
+        }
+
+        displayStream.getTracks().forEach((track) => {
+          peerConnections.current.forEach((pc) => {
+            pc.addTrack(track, displayStream);
+          });
+        });
+
         if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
           wsRef.current.send(
             JSON.stringify({
@@ -294,9 +478,11 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
           );
         }
 
-        if (screenVideoRef.current) {
-          screenVideoRef.current.srcObject = displayStream;
-        }
+        participants.forEach((p) => {
+          if (p.user_id !== currentUser?.id && p.display_name !== displayName) {
+            initiateOffer(p.user_id || p.display_name);
+          }
+        });
 
         // Listen for when the user clicks browser's native "Stop Sharing" floating bar
         const videoTrack = displayStream.getVideoTracks()[0];
@@ -304,6 +490,17 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
           videoTrack.onended = () => {
             setIsScreenSharing(false);
             setScreenStream(null);
+            peerConnections.current.forEach((pc) => {
+              pc.getSenders().forEach((sender) => {
+                if (
+                  sender.track &&
+                  (sender.track.label.toLowerCase().includes('screen') ||
+                    sender.track.label.toLowerCase().includes('display'))
+                ) {
+                  pc.removeTrack(sender);
+                }
+              });
+            });
             if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
               wsRef.current.send(
                 JSON.stringify({
@@ -315,7 +512,6 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
           };
         }
       } else {
-        // Fallback to simulation mode if browser doesn't support getDisplayMedia
         setIsScreenSharing(true);
         if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
           wsRef.current.send(
@@ -333,7 +529,6 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
       if (err.name !== 'NotAllowedError') {
         setScreenShareError(err.message || 'Screen sharing failed. Simulation mode active.');
       }
-      // If user canceled browser picker, keep screen sharing off
     }
   };
 
@@ -411,7 +606,6 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
 
   // Real participants state fetched from DB
   const [participants, setParticipants] = useState<Participant[]>(meeting.participants || []);
-  const { user: currentUser } = useAuth();
 
   // Notices state for real-time WebSocket events
   const [removedNotice, setRemovedNotice] = useState<string | null>(null);
@@ -459,6 +653,14 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
       wsRef.current = ws;
 
       ws.onopen = () => {
+        ws?.send(
+          JSON.stringify({
+            event: 'user_joined',
+            sender_id: myKey,
+            sender_name: displayName,
+          })
+        );
+
         if (isScreenSharing) {
           ws?.send(
             JSON.stringify({
@@ -474,7 +676,28 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
       ws.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
-          if (data.event === 'chat_message' && data.message) {
+
+          if (data.sender_id && String(data.sender_id) === String(myKey)) {
+            return;
+          }
+
+          if (data.event === 'user_joined') {
+            if (data.sender_id) {
+              initiateOffer(data.sender_id);
+            }
+          } else if (data.event === 'webrtc_offer') {
+            if (data.target_id && String(data.target_id) === String(myKey)) {
+              handleOffer(data.sender_id, data.offer);
+            }
+          } else if (data.event === 'webrtc_answer') {
+            if (data.target_id && String(data.target_id) === String(myKey)) {
+              handleAnswer(data.sender_id, data.answer);
+            }
+          } else if (data.event === 'webrtc_ice_candidate') {
+            if (data.target_id && String(data.target_id) === String(myKey)) {
+              handleIceCandidate(data.sender_id, data.candidate);
+            }
+          } else if (data.event === 'chat_message' && data.message) {
             const isFromSelf =
               data.message.sender_user_id === currentUser?.id || data.message.sender === displayName;
             setMessages((prev) => {
@@ -503,6 +726,7 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
           } else if (data.event === 'screen_share_stopped') {
             if (data.sharer_user_id !== currentUser?.id) {
               setRemoteScreenShare({ isSharing: false, sharerName: '', sharerUserId: null });
+              setRemoteScreenShareStream(null);
               setToastNotice('Screen sharing ended');
               setTimeout(() => setToastNotice(null), 3000);
             }
@@ -547,6 +771,8 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
         ws.close();
         wsRef.current = null;
       }
+      peerConnections.current.forEach((pc) => pc.close());
+      peerConnections.current.clear();
     };
   }, [meeting.meeting_id, currentUser?.id, displayName, participantId, stream, screenStream, router, isScreenSharing]);
 
@@ -709,6 +935,18 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
                   playsInline
                   className="w-full h-full object-contain rounded-2xl"
                 />
+              ) : remoteScreenShare.isSharing && (remoteScreenShareStream || (remoteScreenShare.sharerUserId ? remoteStreamsState[remoteScreenShare.sharerUserId] : null)) ? (
+                <video
+                  ref={(el) => {
+                    const activeStr = remoteScreenShareStream || (remoteScreenShare.sharerUserId ? remoteStreamsState[remoteScreenShare.sharerUserId] : null);
+                    if (el && activeStr) {
+                      el.srcObject = activeStr;
+                    }
+                  }}
+                  autoPlay
+                  playsInline
+                  className="w-full h-full object-contain rounded-2xl"
+                />
               ) : (
                 /* Live Presentation Stream / Remote Screen View */
                 <div className="text-center space-y-4 max-w-md">
@@ -784,17 +1022,43 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
                   );
                 }
 
+                const rStream = remoteStreamsState[p.user_id] || remoteStreamsState[p.display_name] || remoteStreamsState[p.id];
+
                 return (
                   <div
                     key={p.id}
                     className="relative w-full h-full min-h-[240px] glass-card rounded-3xl overflow-hidden border border-gray-800/80 shadow-2xl flex items-center justify-center group bg-gray-950"
                   >
-                    <div className="absolute inset-0 bg-gradient-to-tr from-indigo-950/40 via-gray-900 to-slate-900 flex flex-col items-center justify-center">
-                      <div className="w-20 h-20 rounded-full bg-gradient-to-tr from-indigo-500 to-purple-600 flex items-center justify-center text-white font-bold text-xl shadow-2xl border-2 border-white/20 relative">
-                        {p.display_name.slice(0, 2).toUpperCase()}
-                        <span className="absolute bottom-1 right-1 w-3.5 h-3.5 bg-emerald-500 border-2 border-gray-900 rounded-full" />
+                    {rStream && rStream.getVideoTracks().length > 0 && rStream.getVideoTracks()[0].enabled ? (
+                      <video
+                        ref={(vEl) => {
+                          if (vEl && rStream) {
+                            vEl.srcObject = rStream;
+                          }
+                        }}
+                        autoPlay
+                        playsInline
+                        className="w-full h-full object-cover"
+                      />
+                    ) : (
+                      <div className="absolute inset-0 bg-gradient-to-tr from-indigo-950/40 via-gray-900 to-slate-900 flex flex-col items-center justify-center">
+                        <div className="w-20 h-20 rounded-full bg-gradient-to-tr from-indigo-500 to-purple-600 flex items-center justify-center text-white font-bold text-xl shadow-2xl border-2 border-white/20 relative">
+                          {p.display_name.slice(0, 2).toUpperCase()}
+                          <span className="absolute bottom-1 right-1 w-3.5 h-3.5 bg-emerald-500 border-2 border-gray-900 rounded-full" />
+                        </div>
                       </div>
-                    </div>
+                    )}
+
+                    {rStream && (
+                      <audio
+                        ref={(aEl) => {
+                          if (aEl && rStream) {
+                            aEl.srcObject = rStream;
+                          }
+                        }}
+                        autoPlay
+                      />
+                    )}
 
                     {/* Name & Role Overlay */}
                     <div className="absolute bottom-4 left-4 flex items-center gap-2 px-3 py-1.5 rounded-xl bg-black/60 backdrop-blur-md border border-white/10 text-xs font-medium text-white">
