@@ -127,6 +127,20 @@ def remove_participant(
     )
 
 
+@router.post("/{meeting_id}/mute-all")
+def mute_all(
+    meeting_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """Mute all participants in a meeting room (Host/Co-Host/Admin action)."""
+    return meeting_service.mute_all_participants(
+        db,
+        meeting_id,
+        current_user
+    )
+
+
 @router.post("/{meeting_id}/leave", response_model=ParticipantResponse)
 def leave(
     meeting_id: str,

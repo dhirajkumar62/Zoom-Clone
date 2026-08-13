@@ -25,7 +25,7 @@ import {
 import { useRouter } from 'next/navigation';
 import { Meeting, Participant } from '@/lib/types';
 import { formatMeetingId } from '@/lib/utils';
-import { leaveMeeting, endMeeting, getMeetingParticipants, updateParticipantRole, removeParticipant } from '@/lib/api';
+import { leaveMeeting, endMeeting, getMeetingParticipants, updateParticipantRole, removeParticipant, muteAllParticipants } from '@/lib/api';
 import { useAuth } from '@/context/AuthContext';
 
 interface MeetingRoomProps {
@@ -345,6 +345,10 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
   const [participants, setParticipants] = useState<Participant[]>(meeting.participants || []);
   const { user: currentUser } = useAuth();
 
+  // Notices state for real-time WebSocket events
+  const [removedNotice, setRemovedNotice] = useState<string | null>(null);
+  const [toastNotice, setToastNotice] = useState<string | null>(null);
+
   const loadRealParticipants = async () => {
     try {
       const data = await getMeetingParticipants(meeting.meeting_id);
@@ -359,6 +363,51 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
     const interval = setInterval(loadRealParticipants, 3000);
     return () => clearInterval(interval);
   }, [meeting.meeting_id]);
+
+  // Real-Time WebSocket event listener
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const cleanId = meeting.meeting_id.replace(/\D/g, '');
+    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsHost = window.location.hostname || 'localhost';
+    const wsUrl = `${wsProtocol}//${wsHost}:8000/api/ws/meetings/${cleanId}`;
+
+    let ws: WebSocket | null = null;
+    try {
+      ws = new WebSocket(wsUrl);
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.event === 'mute_all') {
+            setIsMicOn(false);
+            setToastNotice('The meeting host has muted all participants.');
+            setTimeout(() => setToastNotice(null), 4000);
+          } else if (data.event === 'participant_removed') {
+            if (data.target_user_id === currentUser?.id || data.participant_id === participantId) {
+              setRemovedNotice('You have been removed from the meeting by the host.');
+              if (stream) stream.getTracks().forEach((t) => t.stop());
+              if (screenStream) screenStream.getTracks().forEach((t) => t.stop());
+              setTimeout(() => {
+                router.push('/dashboard');
+              }, 3000);
+            } else {
+              loadRealParticipants();
+            }
+          } else if (data.event === 'participant_joined' || data.event === 'participant_left') {
+            loadRealParticipants();
+          }
+        } catch {
+          // Ignore parse errors
+        }
+      };
+    } catch {
+      // Fallback to polling if WebSocket disabled
+    }
+
+    return () => {
+      if (ws) ws.close();
+    };
+  }, [meeting.meeting_id, currentUser?.id, participantId, stream, screenStream, router]);
 
   // Determine current user's meeting role
   const myParticipant = participants.find(
@@ -391,9 +440,64 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
     }
   };
 
+  const handleMuteAll = async () => {
+    try {
+      await muteAllParticipants(meeting.meeting_id);
+      setIsMicOn(false);
+      setToastNotice('All participants have been muted.');
+      setTimeout(() => setToastNotice(null), 3000);
+    } catch (err: any) {
+      alert(err.message || 'Failed to mute all participants');
+    }
+  };
+
+  // Dynamic grid class based on participant count
+  const getGridClass = (count: number) => {
+    if (count <= 1) return 'grid-cols-1 max-w-3xl mx-auto';
+    if (count === 2) return 'grid-cols-1 md:grid-cols-2 max-w-5xl mx-auto';
+    if (count <= 4) return 'grid-cols-1 sm:grid-cols-2 max-w-5xl mx-auto';
+    if (count <= 6) return 'grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 max-w-6xl mx-auto';
+    return 'grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 max-w-7xl mx-auto';
+  };
+
+  const activeParticipantsList = participants.length > 0
+    ? participants
+    : [
+        {
+          id: participantId || 1,
+          meeting_id: meeting.id,
+          user_id: currentUser?.id || 1,
+          display_name: displayName,
+          meeting_role: myMeetingRole,
+          joined_at: new Date().toISOString(),
+        } as Participant,
+      ];
 
   return (
-    <div className="flex flex-col h-screen w-screen bg-[#070a12] text-white overflow-hidden select-none">
+    <div className="flex flex-col h-screen w-screen bg-[#070a12] text-white overflow-hidden select-none relative">
+      {/* Toast Notification Banner */}
+      {toastNotice && (
+        <div className="absolute top-20 left-1/2 -translate-x-1/2 z-50 px-4 py-2.5 rounded-2xl bg-amber-500/90 text-black font-semibold text-xs shadow-2xl flex items-center gap-2 animate-bounce">
+          <AlertCircle className="w-4 h-4 text-black flex-shrink-0" />
+          <span>{toastNotice}</span>
+        </div>
+      )}
+
+      {/* Removed Participant Modal */}
+      {removedNotice && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/90 backdrop-blur-xl animate-fadeIn">
+          <div className="glass-panel w-full max-w-md p-8 rounded-3xl border border-red-500/40 shadow-2xl text-center space-y-4">
+            <div className="w-16 h-16 rounded-full bg-red-500/20 text-red-400 border border-red-500/40 flex items-center justify-center mx-auto animate-pulse">
+              <AlertCircle className="w-8 h-8" />
+            </div>
+            <h3 className="text-xl font-bold text-white">{removedNotice}</h3>
+            <p className="text-xs text-gray-400">
+              You will be redirected back to your dashboard automatically...
+            </p>
+          </div>
+        </div>
+      )}
+
       {/* Top Meeting Header Bar */}
       <header className="h-16 px-6 glass-panel border-b border-gray-800 flex items-center justify-between z-30">
         <div className="flex items-center gap-4">
@@ -476,78 +580,106 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
               )}
             </div>
           ) : (
-            /* Video Grid Layout */
-            <div className="w-full h-full max-w-6xl grid grid-cols-1 md:grid-cols-2 gap-4 lg:gap-6 items-center justify-center">
-              {/* Tile 1: Current User Video Feed */}
-              <div className="relative w-full h-full min-h-[260px] glass-card rounded-3xl overflow-hidden border border-gray-800/80 shadow-2xl flex items-center justify-center group bg-black">
-                {isCameraOn ? (
-                  useRealWebcam ? (
-                    <video
-                      ref={videoRef}
-                      autoPlay
-                      playsInline
-                      muted
-                      className="w-full h-full object-cover transform -scale-x-100"
-                    />
-                  ) : (
-                    <canvas ref={canvasRef} width={640} height={480} className="w-full h-full object-cover" />
-                  )
-                ) : (
-                  <div className="flex flex-col items-center gap-3">
-                    <div className="w-24 h-24 rounded-full bg-gradient-to-tr from-blue-600 to-indigo-600 flex items-center justify-center text-white font-bold text-2xl shadow-2xl border-2 border-white/20">
-                      {displayName.slice(0, 2).toUpperCase()}
+            /* Dynamic Video Grid Layout */
+            <div className={`w-full h-full grid gap-4 lg:gap-6 items-center justify-center ${getGridClass(activeParticipantsList.length)}`}>
+              {activeParticipantsList.map((p) => {
+                const isMe = p.user_id === currentUser?.id || p.display_name === displayName;
+
+                if (isMe) {
+                  return (
+                    <div
+                      key={p.id}
+                      className="relative w-full h-full min-h-[240px] glass-card rounded-3xl overflow-hidden border border-gray-800/80 shadow-2xl flex items-center justify-center group bg-black"
+                    >
+                      {isCameraOn ? (
+                        useRealWebcam ? (
+                          <video
+                            ref={videoRef}
+                            autoPlay
+                            playsInline
+                            muted
+                            className="w-full h-full object-cover transform -scale-x-100"
+                          />
+                        ) : (
+                          <canvas ref={canvasRef} width={640} height={480} className="w-full h-full object-cover" />
+                        )
+                      ) : (
+                        <div className="flex flex-col items-center gap-3">
+                          <div className="w-20 h-20 rounded-full bg-gradient-to-tr from-blue-600 to-indigo-600 flex items-center justify-center text-white font-bold text-xl shadow-2xl border-2 border-white/20">
+                            {displayName.slice(0, 2).toUpperCase()}
+                          </div>
+                          <span className="text-xs font-medium text-gray-400">Camera turned off</span>
+                        </div>
+                      )}
+
+                      {/* Camera Mode Badge */}
+                      {isCameraOn && (
+                        <div className="absolute top-4 right-4 flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-black/60 backdrop-blur-md border border-white/10 text-[10px] text-gray-300">
+                          <Camera className="w-3 h-3 text-blue-400" />
+                          <span>{useRealWebcam ? 'Live Webcam' : 'Simulated Feed'}</span>
+                        </div>
+                      )}
+
+                      {/* Name Overlay & Microphone Status Badge */}
+                      <div className="absolute bottom-4 left-4 flex items-center gap-2 px-3 py-1.5 rounded-xl bg-black/60 backdrop-blur-md border border-white/10 text-xs font-medium text-white">
+                        <span>{displayName} (You)</span>
+                        {isMicOn ? (
+                          <div className="flex items-center gap-1 text-emerald-400" title="Microphone Active">
+                            <Mic className="w-3.5 h-3.5" />
+                            <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                          </div>
+                        ) : (
+                          <div className="flex items-center gap-1 text-red-400" title="Microphone Muted">
+                            <MicOff className="w-3.5 h-3.5" />
+                            <span className="text-[10px] font-bold uppercase">Muted</span>
+                          </div>
+                        )}
+                      </div>
                     </div>
-                    <span className="text-xs font-medium text-gray-400">Camera turned off</span>
-                  </div>
-                )}
+                  );
+                }
 
-                {/* Camera Mode Badge */}
-                {isCameraOn && (
-                  <div className="absolute top-4 right-4 flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-black/60 backdrop-blur-md border border-white/10 text-[10px] text-gray-300">
-                    <Camera className="w-3 h-3 text-blue-400" />
-                    <span>{useRealWebcam ? 'Live Webcam' : 'Simulated Feed'}</span>
-                  </div>
-                )}
-
-                {/* Name Overlay & Microphone Status Badge */}
-                <div className="absolute bottom-4 left-4 flex items-center gap-2 px-3 py-1.5 rounded-xl bg-black/60 backdrop-blur-md border border-white/10 text-xs font-medium text-white">
-                  <span>{displayName} (You)</span>
-                  {isMicOn ? (
-                    <div className="flex items-center gap-1 text-emerald-400" title="Microphone Active">
-                      <Mic className="w-3.5 h-3.5" />
-                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                return (
+                  <div
+                    key={p.id}
+                    className="relative w-full h-full min-h-[240px] glass-card rounded-3xl overflow-hidden border border-gray-800/80 shadow-2xl flex items-center justify-center group bg-gray-950"
+                  >
+                    <div className="absolute inset-0 bg-gradient-to-tr from-indigo-950/40 via-gray-900 to-slate-900 flex flex-col items-center justify-center">
+                      <div className="w-20 h-20 rounded-full bg-gradient-to-tr from-indigo-500 to-purple-600 flex items-center justify-center text-white font-bold text-xl shadow-2xl border-2 border-white/20 relative">
+                        {p.display_name.slice(0, 2).toUpperCase()}
+                        <span className="absolute bottom-1 right-1 w-3.5 h-3.5 bg-emerald-500 border-2 border-gray-900 rounded-full" />
+                      </div>
                     </div>
-                  ) : (
-                    <div className="flex items-center gap-1 text-red-400" title="Microphone Muted">
-                      <MicOff className="w-3.5 h-3.5" />
-                      <span className="text-[10px] font-bold uppercase">Muted</span>
+
+                    {/* Name & Role Overlay */}
+                    <div className="absolute bottom-4 left-4 flex items-center gap-2 px-3 py-1.5 rounded-xl bg-black/60 backdrop-blur-md border border-white/10 text-xs font-medium text-white">
+                      <span>{p.display_name}</span>
+                      {p.meeting_role === 'HOST' && (
+                        <span className="px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 text-[10px] font-bold">
+                          HOST
+                        </span>
+                      )}
+                      {p.meeting_role === 'CO_HOST' && (
+                        <span className="px-1.5 py-0.5 rounded bg-purple-500/20 text-purple-300 text-[10px] font-bold">
+                          CO-HOST
+                        </span>
+                      )}
+                      {p.is_muted ? (
+                        <span title="Muted"><MicOff className="w-3.5 h-3.5 text-red-400" /></span>
+                      ) : (
+                        <span title="Active Mic"><Mic className="w-3.5 h-3.5 text-emerald-400" /></span>
+                      )}
                     </div>
-                  )}
-                </div>
-              </div>
-
-              {/* Tile 2: Host / Participant Tile */}
-              <div className="relative w-full h-full min-h-[260px] glass-card rounded-3xl overflow-hidden border border-gray-800/80 shadow-2xl flex items-center justify-center group">
-                <div className="absolute inset-0 bg-gradient-to-tr from-indigo-950/40 via-gray-900 to-slate-900 flex flex-col items-center justify-center">
-                  <div className="w-24 h-24 rounded-full bg-gradient-to-tr from-indigo-500 to-purple-600 flex items-center justify-center text-white font-bold text-2xl shadow-2xl border-2 border-white/20 relative">
-                    DU
-                    <span className="absolute bottom-1 right-1 w-4 h-4 bg-emerald-500 border-2 border-gray-900 rounded-full" />
                   </div>
-                </div>
-
-                {/* Name Overlay */}
-                <div className="absolute bottom-4 left-4 flex items-center gap-2 px-3 py-1.5 rounded-xl bg-black/60 backdrop-blur-md border border-white/10 text-xs font-medium text-white">
-                  <span>Default User (Host)</span>
-                  <Mic className="w-3.5 h-3.5 text-emerald-400" />
-                </div>
-              </div>
+                );
+              })}
             </div>
           )}
         </main>
 
         {/* Side Drawer: Participants List */}
         {activeTab === 'participants' && (
-          <aside className="w-80 glass-panel border-l border-gray-800 flex flex-col z-20 animate-slideLeft">
+          <aside className="fixed sm:relative inset-y-0 right-0 z-40 w-full sm:w-80 glass-panel border-l border-gray-800 flex flex-col animate-slideLeft shadow-2xl">
             <div className="p-4 border-b border-gray-800 flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <Users className="w-4 h-4 text-blue-400" />
@@ -632,10 +764,9 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
           </aside>
         )}
 
-
         {/* Side Drawer: In-Meeting Live Chat */}
         {activeTab === 'chat' && (
-          <aside className="w-80 glass-panel border-l border-gray-800 flex flex-col z-20 animate-slideLeft">
+          <aside className="fixed sm:relative inset-y-0 right-0 z-40 w-full sm:w-80 glass-panel border-l border-gray-800 flex flex-col animate-slideLeft shadow-2xl">
             <div className="p-4 border-b border-gray-800 flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <MessageSquare className="w-4 h-4 text-blue-400" />
@@ -797,7 +928,7 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
       )}
 
       {/* Bottom Floating Control Toolbar */}
-      <footer className="h-20 px-6 glass-panel border-t border-gray-800 flex items-center justify-between z-30">
+      <footer className="h-20 px-4 sm:px-6 glass-panel border-t border-gray-800 flex items-center justify-between z-30">
         {/* Left Info */}
         <div className="hidden md:flex items-center gap-2 text-xs text-gray-400">
           <Volume2 className="w-4 h-4 text-gray-400" />
@@ -805,11 +936,11 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
         </div>
 
         {/* Center Control Buttons */}
-        <div className="flex items-center gap-3 mx-auto md:mx-0">
+        <div className="flex items-center gap-2 sm:gap-3 mx-auto md:mx-0 overflow-x-auto py-1">
           {/* Mute Mic */}
           <button
             onClick={() => setIsMicOn(!isMicOn)}
-            className={`p-3.5 rounded-2xl flex items-center gap-2 transition-all font-semibold text-xs ${
+            className={`p-3 sm:p-3.5 rounded-2xl flex items-center gap-2 transition-all font-semibold text-xs ${
               isMicOn
                 ? 'bg-gray-800 hover:bg-gray-700 text-gray-100 border border-gray-700'
                 : 'bg-red-500/20 hover:bg-red-500/30 text-red-400 border border-red-500/40'
@@ -822,7 +953,7 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
           {/* Toggle Camera */}
           <button
             onClick={() => setIsCameraOn(!isCameraOn)}
-            className={`p-3.5 rounded-2xl flex items-center gap-2 transition-all font-semibold text-xs ${
+            className={`p-3 sm:p-3.5 rounded-2xl flex items-center gap-2 transition-all font-semibold text-xs ${
               isCameraOn
                 ? 'bg-gray-800 hover:bg-gray-700 text-gray-100 border border-gray-700'
                 : 'bg-red-500/20 hover:bg-red-500/30 text-red-400 border border-red-500/40'
@@ -832,10 +963,22 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
             {isCameraOn ? <VideoIcon className="w-5 h-5" /> : <VideoOff className="w-5 h-5 text-red-400" />}
           </button>
 
+          {/* Mute All (Host Control) */}
+          {canManageRoles && (
+            <button
+              onClick={handleMuteAll}
+              className="p-3 sm:p-3.5 rounded-2xl flex items-center gap-2 transition-all font-semibold text-xs bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40"
+              title="Mute All Participants (Host Control)"
+            >
+              <MicOff className="w-5 h-5 text-amber-400" />
+              <span className="hidden sm:inline">Mute All</span>
+            </button>
+          )}
+
           {/* Screen Share */}
           <button
             onClick={handleToggleScreenShare}
-            className={`p-3.5 rounded-2xl flex items-center gap-2 transition-all font-semibold text-xs ${
+            className={`p-3 sm:p-3.5 rounded-2xl flex items-center gap-2 transition-all font-semibold text-xs ${
               isScreenSharing
                 ? 'bg-blue-600 text-white shadow-lg shadow-blue-600/30 ring-2 ring-blue-400/50'
                 : 'bg-gray-800 hover:bg-gray-700 text-gray-100 border border-gray-700'
@@ -849,7 +992,7 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
           {/* Participants */}
           <button
             onClick={() => setActiveTab(activeTab === 'participants' ? 'none' : 'participants')}
-            className={`p-3.5 rounded-2xl flex items-center gap-2 transition-all font-semibold text-xs relative ${
+            className={`p-3 sm:p-3.5 rounded-2xl flex items-center gap-2 transition-all font-semibold text-xs relative ${
               activeTab === 'participants'
                 ? 'bg-blue-600 text-white'
                 : 'bg-gray-800 hover:bg-gray-700 text-gray-100 border border-gray-700'
@@ -863,7 +1006,7 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
           {/* Chat */}
           <button
             onClick={() => setActiveTab(activeTab === 'chat' ? 'none' : 'chat')}
-            className={`p-3.5 rounded-2xl flex items-center gap-2 transition-all font-semibold text-xs ${
+            className={`p-3 sm:p-3.5 rounded-2xl flex items-center gap-2 transition-all font-semibold text-xs ${
               activeTab === 'chat'
                 ? 'bg-blue-600 text-white'
                 : 'bg-gray-800 hover:bg-gray-700 text-gray-100 border border-gray-700'
@@ -877,7 +1020,7 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
           {/* Leave Button */}
           <button
             onClick={handleLeaveMeeting}
-            className="flex items-center gap-2 px-5 py-3.5 rounded-2xl bg-red-600 hover:bg-red-500 text-white font-bold text-xs shadow-lg shadow-red-600/30 transition-all ml-2"
+            className="flex items-center gap-2 px-4 sm:px-5 py-3 sm:py-3.5 rounded-2xl bg-red-600 hover:bg-red-500 text-white font-bold text-xs shadow-lg shadow-red-600/30 transition-all ml-1"
           >
             <PhoneOff className="w-5 h-5" />
             <span>Leave</span>
@@ -886,12 +1029,14 @@ export default function MeetingRoom({ meeting, displayName, participantId }: Mee
 
         {/* Right End Call Host Action */}
         <div className="hidden lg:flex items-center gap-2">
-          <button
-            onClick={handleEndMeeting}
-            className="px-3 py-2 rounded-xl text-xs font-semibold text-red-400 hover:bg-red-500/10 border border-red-500/30 transition-colors"
-          >
-            End Meeting for All
-          </button>
+          {canManageRoles && (
+            <button
+              onClick={handleEndMeeting}
+              className="px-3 py-2 rounded-xl text-xs font-semibold text-red-400 hover:bg-red-500/10 border border-red-500/30 transition-colors"
+            >
+              End Meeting for All
+            </button>
+          )}
         </div>
       </footer>
     </div>

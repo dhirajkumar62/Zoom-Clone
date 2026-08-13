@@ -92,6 +92,19 @@ def join_meeting(
             detail="This meeting has ended and is no longer accepting participants."
         )
 
+    # Check if user was previously removed by host from this meeting
+    removed = db.query(Participant).filter(
+        Participant.meeting_id == meeting.id,
+        Participant.user_id == current_user.id,
+        Participant.is_removed == True
+    ).first()
+
+    if removed:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You have been removed from this meeting by the host and cannot rejoin."
+        )
+
     if meeting.status == "scheduled":
         meeting.status = "active"
         if not meeting.started_at:
@@ -126,6 +139,22 @@ def join_meeting(
     db.add(participant)
     db.commit()
     db.refresh(participant)
+
+    # Broadcast participant_joined event
+    try:
+        import asyncio
+        from app.core.ws_manager import ws_manager
+        clean_id = normalize_meeting_id(raw_id_input)
+        asyncio.create_task(ws_manager.broadcast(clean_id, {
+            "event": "participant_joined",
+            "participant_id": participant.id,
+            "user_id": participant.user_id,
+            "display_name": participant.display_name,
+            "meeting_role": participant.meeting_role
+        }))
+    except Exception:
+        pass
+
     return participant
 
 
@@ -146,6 +175,8 @@ def get_active_meeting_participants(db: Session, raw_id_input: str) -> List[Dict
             "user_id": p.user_id,
             "display_name": p.display_name,
             "meeting_role": p.meeting_role,
+            "is_muted": p.is_muted,
+            "is_removed": p.is_removed,
             "joined_at": p.joined_at,
             "left_at": p.left_at,
             "email": user_email,
@@ -197,13 +228,61 @@ def update_participant_role(
     return participant
 
 
+def mute_all_participants(
+    db: Session,
+    raw_id_input: str,
+    current_user: User
+) -> Dict[str, Any]:
+    """Mute all active participants in a meeting room."""
+    meeting = get_meeting_by_id(db, raw_id_input)
+    is_host = meeting.host_user_id == current_user.id
+    is_admin = current_user.account_role in ["ADMIN", "OWNER"]
+
+    co_host = db.query(Participant).filter(
+        Participant.meeting_id == meeting.id,
+        Participant.user_id == current_user.id,
+        Participant.meeting_role == "CO_HOST",
+        Participant.left_at.is_(None)
+    ).first()
+
+    if not is_host and not is_admin and not co_host:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only meeting hosts, co-hosts, or administrators can mute all participants."
+        )
+
+    active_participants = db.query(Participant).filter(
+        Participant.meeting_id == meeting.id,
+        Participant.left_at.is_(None)
+    ).all()
+
+    for p in active_participants:
+        p.is_muted = True
+
+    db.commit()
+
+    clean_id = normalize_meeting_id(raw_id_input)
+    try:
+        import asyncio
+        from app.core.ws_manager import ws_manager
+        asyncio.create_task(ws_manager.broadcast(clean_id, {
+            "event": "mute_all",
+            "requested_by_user_id": current_user.id,
+            "host_name": current_user.name
+        }))
+    except Exception:
+        pass
+
+    return {"message": "All participants muted successfully", "muted_count": len(active_participants)}
+
+
 def remove_participant(
     db: Session,
     raw_id_input: str,
     participant_id: int,
     current_user: User
 ) -> Participant:
-    """Remove a participant from an active meeting (sets left_at)."""
+    """Remove a participant from an active meeting (sets left_at and is_removed)."""
     meeting = get_meeting_by_id(db, raw_id_input)
 
     # Check caller authorization: Must be Host, Co-Host, Admin, or Owner
@@ -235,9 +314,24 @@ def remove_participant(
             detail="Participant record not found."
         )
 
+    participant.is_removed = True
     participant.left_at = datetime.utcnow()
     db.commit()
     db.refresh(participant)
+
+    clean_id = normalize_meeting_id(raw_id_input)
+    try:
+        import asyncio
+        from app.core.ws_manager import ws_manager
+        asyncio.create_task(ws_manager.broadcast(clean_id, {
+            "event": "participant_removed",
+            "participant_id": participant.id,
+            "target_user_id": participant.user_id,
+            "display_name": participant.display_name
+        }))
+    except Exception:
+        pass
+
     return participant
 
 

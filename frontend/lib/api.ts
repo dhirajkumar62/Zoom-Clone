@@ -133,6 +133,15 @@ export async function removeParticipant(meetingId: string, participantId: number
   return handleResponse<Participant>(res);
 }
 
+export async function muteAllParticipants(meetingId: string): Promise<{ message: string; muted_count: number }> {
+  const cleanId = meetingId.replace(/\D/g, '');
+  const res = await fetch(`${API_BASE_URL}/meetings/${cleanId}/mute-all`, {
+    method: 'POST',
+    headers: getHeaders(),
+  });
+  return handleResponse<{ message: string; muted_count: number }>(res);
+}
+
 export async function leaveMeeting(meetingId: string, participantId?: number): Promise<Participant> {
   const cleanId = meetingId.replace(/\D/g, '');
   const url = participantId

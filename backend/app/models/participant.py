@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey
 from sqlalchemy.orm import relationship
 from datetime import datetime
 from app.database import Base
@@ -12,6 +12,8 @@ class Participant(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     display_name = Column(String, nullable=False)
     meeting_role = Column(String, nullable=False, default="PARTICIPANT")  # HOST, CO_HOST, PARTICIPANT
+    is_muted = Column(Boolean, default=False, nullable=False)
+    is_removed = Column(Boolean, default=False, nullable=False)
     joined_at = Column(DateTime, default=datetime.utcnow)
     left_at = Column(DateTime, nullable=True)
 

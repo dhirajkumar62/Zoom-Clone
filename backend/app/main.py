@@ -7,6 +7,7 @@ from app.database import engine, Base, SessionLocal
 from app.routers import health_router, meetings_router
 from app.routers.auth import router as auth_router
 from app.routers.admin import router as admin_router
+from app.routers.websocket import router as ws_router
 from app.seed import seed_database
 
 load_dotenv()
@@ -50,6 +51,7 @@ app.include_router(health_router)
 app.include_router(auth_router)
 app.include_router(meetings_router)
 app.include_router(admin_router)
+app.include_router(ws_router)
 
 
 

@@ -37,6 +37,8 @@ export interface Participant {
   joined_at: string;
   left_at: string | null;
   email?: string;
+  is_muted?: boolean;
+  is_removed?: boolean;
 }
 
 export interface Meeting {
