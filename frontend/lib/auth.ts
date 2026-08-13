@@ -1,6 +1,12 @@
 import { AuthResponse, LoginCredentials, RegisterCredentials, User } from './types';
 
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000/api';
+const getApiBaseUrl = () => {
+  const envUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000/api';
+  const cleanUrl = envUrl.replace(/\/+$/, '');
+  return cleanUrl.endsWith('/api') ? cleanUrl : `${cleanUrl}/api`;
+};
+
+const API_BASE_URL = getApiBaseUrl();
 const TOKEN_KEY = 'meetflow_auth_token';
 
 export function getStoredToken(): string | null {

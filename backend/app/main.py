@@ -12,8 +12,21 @@ from app.seed import seed_database
 
 load_dotenv()
 
-FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
+frontend_url_env = os.getenv("FRONTEND_URL", "")
+allowed_origins_env = os.getenv("ALLOWED_ORIGINS", "")
 
+origins = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "https://zoom-clone-six-rouge.vercel.app",
+]
+
+for env_val in [frontend_url_env, allowed_origins_env]:
+    if env_val:
+        for item in env_val.split(","):
+            cleaned = item.strip().rstrip("/")
+            if cleaned and cleaned not in origins:
+                origins.append(cleaned)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -33,15 +46,10 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-origins = [
-    FRONTEND_URL,
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-]
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
+    allow_origin_regex=r"https://.*",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
